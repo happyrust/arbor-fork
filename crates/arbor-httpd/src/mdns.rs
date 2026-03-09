@@ -1,8 +1,7 @@
-use std::sync::Arc;
-use std::thread;
-
-use zeroconf::prelude::*;
-use zeroconf::{MdnsService, ServiceType, TxtRecord};
+use {
+    std::{sync::Arc, thread},
+    zeroconf::{MdnsService, ServiceType, TxtRecord, prelude::*},
+};
 
 const SERVICE_NAME: &str = "arbor";
 const SERVICE_PROTOCOL: &str = "tcp";
@@ -31,8 +30,22 @@ pub fn register_service(
         ServiceType::new(SERVICE_NAME, SERVICE_PROTOCOL).map_err(MdnsError::ServiceInit)?;
 
     let mut txt = TxtRecord::new();
-    let _ = txt.insert("tls", if tls { "true" } else { "false" });
-    let _ = txt.insert("auth", if has_auth { "true" } else { "false" });
+    let _ = txt.insert(
+        "tls",
+        if tls {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    let _ = txt.insert(
+        "auth",
+        if has_auth {
+            "true"
+        } else {
+            "false"
+        },
+    );
     let _ = txt.insert("version", env!("CARGO_PKG_VERSION"));
 
     let instance_name = hostname::get()
@@ -49,15 +62,13 @@ pub fn register_service(
             let mut service = MdnsService::new(service_type, port);
             service.set_name(&instance_name);
             service.set_txt_record(txt);
-            service.set_registered_callback(Box::new(|result, _| {
-                match result {
-                    Ok(registration) => {
-                        tracing::info!("mDNS service registered: {}", registration.name());
-                    }
-                    Err(err) => {
-                        tracing::error!("mDNS registration error: {err}");
-                    }
-                }
+            service.set_registered_callback(Box::new(|result, _| match result {
+                Ok(registration) => {
+                    tracing::info!("mDNS service registered: {}", registration.name());
+                },
+                Err(err) => {
+                    tracing::error!("mDNS registration error: {err}");
+                },
             }));
 
             let event_loop = match service.register() {
@@ -65,7 +76,7 @@ pub fn register_service(
                 Err(e) => {
                     tracing::error!("mDNS register failed: {e}");
                     return;
-                }
+                },
             };
 
             loop {

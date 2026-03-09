@@ -28,6 +28,7 @@ git2 = { workspace = true }
 gix = { workspace = true }
 gix-diff = { workspace = true, features = ["blob-experimental"] }
 gpui = { workspace = true }
+hostname = { workspace = true }
 gpui_http_client = { workspace = true }
 imara-diff = { workspace = true }
 zeroconf = { workspace = true }

@@ -23,11 +23,12 @@ futures-util = "0.3"
 git2         = { workspace = true }
 gix          = { workspace = true }
 hmac         = { workspace = true }
-hostname     = "0.4"
+hostname     = { workspace = true }
 zeroconf     = { workspace = true }
 octocrab     = { workspace = true }
 portable-pty = { workspace = true }
 rand         = { workspace = true }
+secrecy      = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 sha2         = { workspace = true }

@@ -2383,6 +2383,11 @@ impl ArborWindow {
             },
         }
 
+        let local_hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_default();
+
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_spawn(async move {
@@ -2397,6 +2402,10 @@ impl ArborWindow {
                         for event in events {
                             match event {
                                 mdns_browser::MdnsEvent::Added(daemon) => {
+                                    // Skip our own instance
+                                    if daemon.instance_name == local_hostname {
+                                        continue;
+                                    }
                                     // Update existing or insert new
                                     if let Some(existing) = this
                                         .discovered_daemons
@@ -10390,9 +10399,9 @@ impl ArborWindow {
                                     .child(
                                         div()
                                             .font_family(FONT_MONO)
-                                            .text_size(px(12.))
+                                            .text_size(px(14.))
                                             .text_color(rgb(theme.text_muted))
-                                            .child("\u{f012}"), // signal/wifi icon
+                                            .child("\u{f0ac}"), // globe/network icon
                                     )
                                     .child(
                                         div()
@@ -10460,6 +10469,7 @@ impl ArborWindow {
                                                         .flex()
                                                         .items_center()
                                                         .justify_center()
+                                                        .font_family(FONT_MONO)
                                                         .text_size(px(18.))
                                                         .text_color(rgb(theme.accent))
                                                         .child("\u{f233}"), // server icon
@@ -14529,7 +14539,7 @@ impl ArborWindow {
                                         .child(
                                             div()
                                                 .font_family(FONT_MONO)
-                                                .text_size(px(12.))
+                                                .text_size(px(15.))
                                                 .text_color(rgb(theme.text_muted))
                                                 .child("\u{f1da}"),
                                         )
@@ -14662,9 +14672,9 @@ impl ArborWindow {
                                         .child(
                                             div()
                                                 .font_family(FONT_MONO)
-                                                .text_size(px(12.))
+                                                .text_size(px(15.))
                                                 .text_color(rgb(theme.text_muted))
-                                                .child("\u{f012}"),
+                                                .child("\u{f0ac}"),
                                         )
                                         .child(
                                             div()
@@ -14702,6 +14712,7 @@ impl ArborWindow {
                                         .child(
                                             div()
                                                 .flex_none()
+                                                .font_family(FONT_MONO)
                                                 .text_size(px(14.))
                                                 .text_color(rgb(theme.accent))
                                                 .child("\u{f233}"),

@@ -1,8 +1,7 @@
-use std::sync::mpsc;
-use std::thread;
-
-use zeroconf::prelude::*;
-use zeroconf::{BrowserEvent, MdnsBrowser, ServiceType};
+use {
+    std::{sync::mpsc, thread},
+    zeroconf::{BrowserEvent, MdnsBrowser, ServiceType, prelude::*},
+};
 
 const SERVICE_NAME: &str = "arbor";
 const SERVICE_PROTOCOL: &str = "tcp";
@@ -20,7 +19,11 @@ pub struct DiscoveredDaemon {
 
 impl DiscoveredDaemon {
     pub fn base_url(&self) -> String {
-        let scheme = if self.tls { "https" } else { "http" };
+        let scheme = if self.tls {
+            "https"
+        } else {
+            "http"
+        };
         let host = self
             .addresses
             .first()
@@ -82,10 +85,19 @@ pub fn start_browsing() -> Result<Box<dyn MdnsDiscovery>, String> {
                             .and_then(|t| t.get("version"))
                             .unwrap_or_default();
 
+                        let raw_addr = service.address();
+                        // Bonjour sometimes returns 0.0.0.0; fall back to
+                        // hostname (e.g. "m4max.local.") which macOS can resolve.
+                        let address = if raw_addr == "0.0.0.0" || raw_addr.is_empty() {
+                            service.host_name().trim_end_matches('.').to_owned()
+                        } else {
+                            raw_addr.to_owned()
+                        };
+
                         let daemon = DiscoveredDaemon {
                             instance_name: service.name().to_owned(),
                             host: service.host_name().to_owned(),
-                            addresses: vec![service.address().to_owned()],
+                            addresses: vec![address],
                             port: *service.port(),
                             tls,
                             has_auth,
@@ -93,13 +105,13 @@ pub fn start_browsing() -> Result<Box<dyn MdnsDiscovery>, String> {
                         };
 
                         let _ = tx.send(MdnsEvent::Added(daemon));
-                    }
+                    },
                     Ok(BrowserEvent::Remove(removal)) => {
                         let _ = tx.send(MdnsEvent::Removed(removal.name().to_owned()));
-                    }
+                    },
                     Err(err) => {
                         tracing::warn!("mDNS browse error: {err}");
-                    }
+                    },
                 }
             }));
 
@@ -108,7 +120,7 @@ pub fn start_browsing() -> Result<Box<dyn MdnsDiscovery>, String> {
                 Err(err) => {
                     tracing::error!("mDNS browse_services failed: {err}");
                     return;
-                }
+                },
             };
 
             loop {

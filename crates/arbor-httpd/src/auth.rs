@@ -20,6 +20,7 @@ use {
         routing::{get, post},
     },
     hmac::{Hmac, Mac},
+    secrecy::{ExposeSecret, SecretString},
     sha2::Sha256,
     std::{
         collections::HashMap,
@@ -46,7 +47,8 @@ const MAX_TRACKED_REMOTE_IPS: usize = 4096;
 #[derive(Clone)]
 pub struct AuthState {
     /// The configured auth token. If `None`, remote access is blocked entirely.
-    pub auth_token: Option<String>,
+    /// Wrapped in `SecretString` to prevent accidental logging or display.
+    pub auth_token: Option<SecretString>,
     /// Random secret generated at launch for signing session cookies.
     pub session_secret: Arc<[u8; 32]>,
     /// When `false`, non-localhost requests are rejected regardless of auth.
@@ -75,7 +77,9 @@ impl AuthState {
         use rand::Rng;
         rand::rng().fill(&mut secret);
         Self {
-            auth_token: auth_token.and_then(|token| normalize_auth_token(&token)),
+            auth_token: auth_token
+                .and_then(|token| normalize_auth_token(&token))
+                .map(SecretString::from),
             session_secret: Arc::new(secret),
             allow_remote: Arc::new(AtomicBool::new(allow_remote)),
             failed_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -201,7 +205,7 @@ pub async fn auth_middleware(
             .into_response();
     }
 
-    let Some(ref configured_token) = auth.auth_token else {
+    let Some(ref configured_secret) = auth.auth_token else {
         // No token configured — refuse all remote access
         eprintln!(
             "arbor-httpd auth: denied remote request from {} to {} because no auth token is configured",
@@ -218,6 +222,8 @@ pub async fn auth_middleware(
         )
             .into_response();
     };
+
+    let configured_token = configured_secret.expose_secret();
 
     if let Some(retry_after) = auth.blocked_retry_after(addr.ip()) {
         eprintln!(
@@ -328,7 +334,7 @@ async fn handle_login(
         return blocked_response(retry_after);
     }
 
-    let Some(ref configured_token) = auth.auth_token else {
+    let Some(ref configured_secret) = auth.auth_token else {
         if !is_loopback(&addr) {
             eprintln!(
                 "arbor-httpd auth: denied login attempt from {} because no auth token is configured",
@@ -337,6 +343,8 @@ async fn handle_login(
         }
         return (StatusCode::FORBIDDEN, "No auth token configured").into_response();
     };
+
+    let configured_token = configured_secret.expose_secret();
 
     if !constant_time_eq(&form.token, configured_token) {
         if !is_loopback(&addr) {
@@ -599,10 +607,11 @@ mod tests {
     #[test]
     fn trims_auth_tokens_on_creation() {
         let state = AuthState::new(Some("  secret-token  ".to_owned()), true);
-        assert_eq!(state.auth_token.as_deref(), Some("secret-token"));
+        assert!(state.auth_token.is_some());
+        assert_eq!(state.auth_token.unwrap().expose_secret(), "secret-token");
 
         let empty = AuthState::new(Some("   ".to_owned()), true);
-        assert_eq!(empty.auth_token, None);
+        assert!(empty.auth_token.is_none());
     }
 
     #[test]
