@@ -39,6 +39,7 @@ tower-http   = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tower    = "0.5"
 
 [lints]
 workspace = true

@@ -77,6 +77,11 @@ pub struct HealthInfo {
     pub version: String,
 }
 
+#[derive(Debug, Serialize)]
+struct SetBindModeRequest {
+    allow_remote: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebsocketConnectConfig {
     pub url: String,
@@ -263,6 +268,15 @@ impl HttpTerminalDaemon {
         self.expect_status(response, &[200])
     }
 
+    pub fn set_bind_mode(&self, allow_remote: bool) -> Result<(), HttpTerminalDaemonError> {
+        let response = self.send_json(
+            "POST",
+            &format!("{API_PATH_PREFIX}/config/bind"),
+            &SetBindModeRequest { allow_remote },
+        )?;
+        self.expect_status(response, &[200])
+    }
+
     fn send_empty(
         &self,
         method: &str,
@@ -433,6 +447,7 @@ pub trait TerminalDaemonClient: Send + Sync {
     fn list_sessions(&self) -> Result<Vec<DaemonSessionRecord>, HttpTerminalDaemonError>;
     fn health(&self) -> Result<HealthInfo, HttpTerminalDaemonError>;
     fn shutdown(&self) -> Result<(), HttpTerminalDaemonError>;
+    fn set_bind_mode(&self, allow_remote: bool) -> Result<(), HttpTerminalDaemonError>;
 }
 
 impl TerminalDaemonClient for HttpTerminalDaemon {
@@ -502,6 +517,10 @@ impl TerminalDaemonClient for HttpTerminalDaemon {
 
     fn shutdown(&self) -> Result<(), HttpTerminalDaemonError> {
         HttpTerminalDaemon::shutdown(self)
+    }
+
+    fn set_bind_mode(&self, allow_remote: bool) -> Result<(), HttpTerminalDaemonError> {
+        HttpTerminalDaemon::set_bind_mode(self, allow_remote)
     }
 }
 

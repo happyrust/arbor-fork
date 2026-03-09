@@ -24,7 +24,10 @@ use {
     std::{
         collections::HashMap,
         net::{IpAddr, SocketAddr},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     },
 };
@@ -46,6 +49,9 @@ pub struct AuthState {
     pub auth_token: Option<String>,
     /// Random secret generated at launch for signing session cookies.
     pub session_secret: Arc<[u8; 32]>,
+    /// When `false`, non-localhost requests are rejected regardless of auth.
+    /// Toggled at runtime via the `/api/v1/config/bind` endpoint.
+    pub allow_remote: Arc<AtomicBool>,
     failed_attempts: Arc<Mutex<HashMap<IpAddr, FailedAuthState>>>,
 }
 
@@ -64,13 +70,14 @@ enum FailedAuthOutcome {
 }
 
 impl AuthState {
-    pub fn new(auth_token: Option<String>) -> Self {
+    pub fn new(auth_token: Option<String>, allow_remote: bool) -> Self {
         let mut secret = [0u8; 32];
         use rand::Rng;
         rand::rng().fill(&mut secret);
         Self {
             auth_token: auth_token.and_then(|token| normalize_auth_token(&token)),
             session_secret: Arc::new(secret),
+            allow_remote: Arc::new(AtomicBool::new(allow_remote)),
             failed_attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -180,6 +187,18 @@ pub async fn auth_middleware(
     // Localhost always passes through
     if is_loopback(&addr) {
         return next.run(request).await;
+    }
+
+    // Remote access can be disabled at runtime (localhost-only mode).
+    if !auth.allow_remote.load(Ordering::Relaxed) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html(
+                "<h1>Remote access is disabled</h1>\
+                 <p>This Arbor instance is configured for localhost-only access.</p>",
+            ),
+        )
+            .into_response();
     }
 
     let Some(ref configured_token) = auth.auth_token else {
@@ -573,21 +592,22 @@ mod hex {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn trims_auth_tokens_on_creation() {
-        let state = AuthState::new(Some("  secret-token  ".to_owned()));
+        let state = AuthState::new(Some("  secret-token  ".to_owned()), true);
         assert_eq!(state.auth_token.as_deref(), Some("secret-token"));
 
-        let empty = AuthState::new(Some("   ".to_owned()));
+        let empty = AuthState::new(Some("   ".to_owned()), true);
         assert_eq!(empty.auth_token, None);
     }
 
     #[test]
     fn repeated_remote_failures_temporarily_block_an_ip() {
-        let state = AuthState::new(Some("secret".to_owned()));
+        let state = AuthState::new(Some("secret".to_owned()), true);
         let ip = "203.0.113.5"
             .parse::<IpAddr>()
             .unwrap_or_else(|error| panic!("invalid IP literal: {error}"));
@@ -618,5 +638,177 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("12")
         );
+    }
+
+    // ── Integration tests for auth middleware ─────────────────────────
+
+    use tower::ServiceExt;
+
+    /// Build a minimal Axum app with auth middleware protecting a single
+    /// `/test` endpoint that returns 200 OK.
+    fn test_app(auth_state: AuthState) -> Router {
+        let inner = Router::new().route("/test", get(|| async { StatusCode::OK }));
+        with_auth(inner, auth_state)
+    }
+
+    fn remote_addr() -> SocketAddr {
+        "203.0.113.5:12345".parse().unwrap()
+    }
+
+    fn loopback_addr() -> SocketAddr {
+        "127.0.0.1:12345".parse().unwrap()
+    }
+
+    fn make_request(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    fn make_request_with_bearer(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn oneshot_with_addr(app: Router, addr: SocketAddr, request: Request<Body>) -> Response {
+        let app = app.layer(axum::extract::connect_info::MockConnectInfo(addr));
+        app.oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn localhost_only_mode_rejects_remote_requests() {
+        let state = AuthState::new(Some("secret-token".to_owned()), false);
+        let app = test_app(state);
+
+        let response = oneshot_with_addr(app, remote_addr(), make_request("/test")).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn localhost_only_mode_allows_localhost() {
+        let state = AuthState::new(Some("secret-token".to_owned()), false);
+        let app = test_app(state);
+
+        let response = oneshot_with_addr(app, loopback_addr(), make_request("/test")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_auth_token_rejects_remote_requests() {
+        let state = AuthState::new(None, true);
+        let app = test_app(state);
+
+        let response = oneshot_with_addr(app, remote_addr(), make_request("/test")).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn no_auth_token_allows_localhost() {
+        let state = AuthState::new(None, true);
+        let app = test_app(state);
+
+        let response = oneshot_with_addr(app, loopback_addr(), make_request("/test")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn valid_bearer_token_passes_when_remote_allowed() {
+        let state = AuthState::new(Some("secret-token".to_owned()), true);
+        let app = test_app(state);
+
+        let response = oneshot_with_addr(
+            app,
+            remote_addr(),
+            make_request_with_bearer("/test", "secret-token"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_token_returns_401() {
+        let state = AuthState::new(Some("secret-token".to_owned()), true);
+        let app = test_app(state);
+
+        let response = oneshot_with_addr(
+            app,
+            remote_addr(),
+            make_request_with_bearer("/test", "wrong-token"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_returns_401_not_rate_limited() {
+        let state = AuthState::new(Some("secret-token".to_owned()), true);
+
+        // Send many requests with missing credentials — should never block
+        for _ in 0..(AUTH_FAILURE_LIMIT + 5) {
+            let app = test_app(state.clone());
+            let response = oneshot_with_addr(app, remote_addr(), make_request("/test")).await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "missing credentials should return 401, not 429"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_remote_toggle_takes_effect_immediately() {
+        let state = AuthState::new(Some("secret-token".to_owned()), false);
+
+        // Initially blocked
+        let app = test_app(state.clone());
+        let response = oneshot_with_addr(
+            app,
+            remote_addr(),
+            make_request_with_bearer("/test", "secret-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Toggle to allow remote
+        state.allow_remote.store(true, Ordering::Relaxed);
+
+        let app = test_app(state.clone());
+        let response = oneshot_with_addr(
+            app,
+            remote_addr(),
+            make_request_with_bearer("/test", "secret-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Toggle back to localhost-only
+        state.allow_remote.store(false, Ordering::Relaxed);
+
+        let app = test_app(state.clone());
+        let response = oneshot_with_addr(
+            app,
+            remote_addr(),
+            make_request_with_bearer("/test", "secret-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn login_page_accessible_without_auth() {
+        let state = AuthState::new(Some("secret-token".to_owned()), true);
+        let app = test_app(state);
+
+        let response = oneshot_with_addr(app, remote_addr(), make_request("/login")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

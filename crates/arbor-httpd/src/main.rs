@@ -92,6 +92,7 @@ struct AppState {
     pr_cache: Arc<Mutex<HashMap<String, PrCacheEntry>>>,
     repo_cache: Arc<Mutex<HashMap<String, RepoCacheEntry>>>,
     shutdown_signal: Arc<tokio::sync::Notify>,
+    auth_state: auth::AuthState,
 }
 
 #[derive(Debug, Clone)]
@@ -250,11 +251,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load daemon config and ensure auth token exists
     let mut daemon_config = load_daemon_config();
     ensure_auth_token(&mut daemon_config);
+    let allow_remote = is_public_bind(
+        daemon_config.auth_token.as_deref(),
+        daemon_config.bind.as_deref(),
+    );
+    // Always bind to 0.0.0.0 when auth is configured so remote access can be
+    // toggled at runtime without restarting.  The auth middleware enforces
+    // localhost-only mode via the `allow_remote` flag instead.
     let bind_addr = resolve_bind_addr(
         daemon_config.auth_token.as_deref(),
         daemon_config.bind.as_deref(),
     )?;
-    let auth_state = auth::AuthState::new(daemon_config.auth_token);
+    let auth_state = auth::AuthState::new(daemon_config.auth_token, allow_remote);
 
     let daemon_store = JsonDaemonSessionStore::default();
     let (agent_broadcast, _) = tokio::sync::broadcast::channel::<AgentWsEvent>(64);
@@ -291,6 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pr_cache: Arc::new(Mutex::new(HashMap::new())),
         repo_cache: Arc::new(Mutex::new(HashMap::new())),
         shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+        auth_state: auth_state.clone(),
     };
 
     // Spawn background task to monitor process lifecycle
@@ -400,6 +409,15 @@ fn default_bind_addr(auth_token: Option<&str>, port: u16) -> SocketAddr {
         .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
+/// Whether the resolved bind configuration allows remote access.
+fn is_public_bind(auth_token: Option<&str>, configured_bind: Option<&str>) -> bool {
+    match configured_bind.and_then(parse_bind_host) {
+        Some("0.0.0.0") => true,
+        Some(_) => false,
+        None => auth_token.is_some_and(|t| !t.trim().is_empty()),
+    }
+}
+
 fn normalize_daemon_auth_token(raw: Option<String>) -> Option<String> {
     raw.and_then(|token| {
         let trimmed = token.trim();
@@ -437,7 +455,8 @@ fn router(state: AppState) -> Router {
         .route("/processes/{name}/stop", post(stop_process))
         .route("/processes/{name}/restart", post(restart_process))
         .route("/processes/ws", get(process_status_ws))
-        .route("/shutdown", post(shutdown_daemon));
+        .route("/shutdown", post(shutdown_daemon))
+        .route("/config/bind", post(set_bind_mode).get(get_bind_mode));
 
     let with_state = Router::new().nest("/api/v1", api).with_state(state);
 
@@ -472,6 +491,48 @@ async fn shutdown_daemon(
     eprintln!("shutdown requested from {addr}, shutting down");
     state.shutdown_signal.notify_one();
     Ok(StatusCode::OK)
+}
+
+#[derive(Debug, Serialize)]
+struct BindModeResponse {
+    allow_remote: bool,
+}
+
+async fn get_bind_mode(State(state): State<AppState>) -> Json<BindModeResponse> {
+    Json(BindModeResponse {
+        allow_remote: state
+            .auth_state
+            .allow_remote
+            .load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct SetBindModeRequest {
+    allow_remote: bool,
+}
+
+async fn set_bind_mode(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(body): Json<SetBindModeRequest>,
+) -> Result<Json<BindModeResponse>, (StatusCode, Json<ApiError>)> {
+    if !addr.ip().is_loopback() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: "bind mode can only be changed from localhost".to_owned(),
+            }),
+        ));
+    }
+    state
+        .auth_state
+        .allow_remote
+        .store(body.allow_remote, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("bind mode changed: allow_remote={}", body.allow_remote);
+    Ok(Json(BindModeResponse {
+        allow_remote: body.allow_remote,
+    }))
 }
 
 async fn list_repositories(State(state): State<AppState>) -> ApiResult<Vec<RepositoryDto>> {
@@ -1928,6 +1989,7 @@ mod tests {
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
             repo_cache: Arc::new(Mutex::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            auth_state: auth::AuthState::new(None, false),
         }
     }
 

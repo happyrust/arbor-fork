@@ -7449,11 +7449,31 @@ impl ArborWindow {
         self.refresh_config_if_changed(cx);
         self.settings_modal = None;
         if daemon_bind_changed && daemon_url_is_local(&self.daemon_base_url) {
-            self.restart_local_daemon_after_settings_save(cx);
+            let allow_remote = modal.daemon_bind_mode == DaemonBindMode::AllInterfaces;
+            if let Some(daemon) = &self.terminal_daemon {
+                match daemon.set_bind_mode(allow_remote) {
+                    Ok(()) => {
+                        let mode = if allow_remote {
+                            "all interfaces"
+                        } else {
+                            "localhost only"
+                        };
+                        self.notice =
+                            Some(format!("Settings saved. Daemon now listening on {mode}."));
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to update daemon bind mode, restarting");
+                        self.restart_local_daemon_after_settings_save(cx);
+                        return;
+                    },
+                }
+            } else {
+                self.notice = Some("Settings saved".to_owned());
+            }
         } else {
             self.notice = Some("Settings saved".to_owned());
-            cx.notify();
         }
+        cx.notify();
     }
 
     fn restart_local_daemon_after_settings_save(&mut self, cx: &mut Context<Self>) {
@@ -16306,6 +16326,9 @@ fn try_auto_start_daemon(
         .unwrap_or(8787);
 
     let mut cmd = Command::new(&binary);
+    if let Some(path) = AUGMENTED_PATH.get() {
+        cmd.env("PATH", path);
+    }
     cmd.env("ARBOR_HTTPD_PORT", port.to_string())
         .stdin(Stdio::null())
         .stdout(stdout_file)
