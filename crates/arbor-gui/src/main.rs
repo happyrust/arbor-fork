@@ -7624,6 +7624,7 @@ impl ArborWindow {
                 },
                 Err(error) => {
                     let error_text = error.to_string();
+                    tracing::warn!(%error, "failed to create daemon terminal session, falling back to local");
                     if daemon_error_is_connection_refused(&error_text) {
                         self.terminal_daemon = None;
                     } else {

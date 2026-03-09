@@ -176,7 +176,12 @@ impl AuthState {
 }
 
 fn is_loopback(addr: &SocketAddr) -> bool {
-    addr.ip().is_loopback()
+    match addr.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        },
+    }
 }
 
 /// Axum middleware that enforces authentication on non-localhost requests.
@@ -207,10 +212,10 @@ pub async fn auth_middleware(
 
     let Some(ref configured_secret) = auth.auth_token else {
         // No token configured — refuse all remote access
-        eprintln!(
-            "arbor-httpd auth: denied remote request from {} to {} because no auth token is configured",
-            addr.ip(),
-            request_path
+        tracing::warn!(
+            ip = %addr.ip(),
+            path = %request_path,
+            "denied remote request: no auth token configured"
         );
         return (
             StatusCode::FORBIDDEN,
@@ -226,11 +231,11 @@ pub async fn auth_middleware(
     let configured_token = configured_secret.expose_secret();
 
     if let Some(retry_after) = auth.blocked_retry_after(addr.ip()) {
-        eprintln!(
-            "arbor-httpd auth: blocked remote request from {} to {} for another {}s",
-            addr.ip(),
-            request_path,
-            retry_after.as_secs().max(1)
+        tracing::warn!(
+            ip = %addr.ip(),
+            path = %request_path,
+            retry_after_secs = retry_after.as_secs().max(1),
+            "blocked remote request (rate-limited)"
         );
         return blocked_response(retry_after);
     }
@@ -274,27 +279,29 @@ pub async fn auth_middleware(
 
         match auth.record_failure(addr.ip()) {
             FailedAuthOutcome::Blocked { retry_after } => {
-                eprintln!(
-                    "arbor-httpd auth: blocked {} after repeated failures on {} ({failure_reason}) for {}s",
-                    addr.ip(),
-                    request_path,
-                    retry_after.as_secs().max(1)
+                tracing::warn!(
+                    ip = %addr.ip(),
+                    path = %request_path,
+                    reason = failure_reason,
+                    retry_after_secs = retry_after.as_secs().max(1),
+                    "blocked after repeated auth failures"
                 );
                 return blocked_response(retry_after);
             },
             FailedAuthOutcome::NotBlocked => {
-                eprintln!(
-                    "arbor-httpd auth: unauthorized remote request from {} to {} ({failure_reason})",
-                    addr.ip(),
-                    request_path
+                tracing::warn!(
+                    ip = %addr.ip(),
+                    path = %request_path,
+                    reason = failure_reason,
+                    "unauthorized remote request"
                 );
             },
         }
     } else {
-        eprintln!(
-            "arbor-httpd auth: unauthorized remote request from {} to {} (missing credentials)",
-            addr.ip(),
-            request_path
+        tracing::warn!(
+            ip = %addr.ip(),
+            path = %request_path,
+            "unauthorized remote request (missing credentials)"
         );
     }
 
@@ -326,19 +333,19 @@ async fn handle_login(
     if !is_loopback(&addr)
         && let Some(retry_after) = auth.blocked_retry_after(addr.ip())
     {
-        eprintln!(
-            "arbor-httpd auth: blocked login attempt from {} for another {}s",
-            addr.ip(),
-            retry_after.as_secs().max(1)
+        tracing::warn!(
+            ip = %addr.ip(),
+            retry_after_secs = retry_after.as_secs().max(1),
+            "blocked login attempt (rate-limited)"
         );
         return blocked_response(retry_after);
     }
 
     let Some(ref configured_secret) = auth.auth_token else {
         if !is_loopback(&addr) {
-            eprintln!(
-                "arbor-httpd auth: denied login attempt from {} because no auth token is configured",
-                addr.ip()
+            tracing::warn!(
+                ip = %addr.ip(),
+                "denied login attempt: no auth token configured"
             );
         }
         return (StatusCode::FORBIDDEN, "No auth token configured").into_response();
@@ -350,17 +357,17 @@ async fn handle_login(
         if !is_loopback(&addr) {
             match auth.record_failure(addr.ip()) {
                 FailedAuthOutcome::Blocked { retry_after } => {
-                    eprintln!(
-                        "arbor-httpd auth: blocked {} after repeated failed login attempts for {}s",
-                        addr.ip(),
-                        retry_after.as_secs().max(1)
+                    tracing::warn!(
+                        ip = %addr.ip(),
+                        retry_after_secs = retry_after.as_secs().max(1),
+                        "blocked after repeated failed login attempts"
                     );
                     return blocked_response(retry_after);
                 },
                 FailedAuthOutcome::NotBlocked => {
-                    eprintln!(
-                        "arbor-httpd auth: rejected login attempt from {} due to invalid token",
-                        addr.ip()
+                    tracing::warn!(
+                        ip = %addr.ip(),
+                        "rejected login attempt: invalid token"
                     );
                 },
             }
@@ -701,6 +708,18 @@ mod tests {
         let app = test_app(state);
 
         let response = oneshot_with_addr(app, loopback_addr(), make_request("/test")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ipv4_mapped_loopback_is_treated_as_localhost() {
+        let state = AuthState::new(Some("secret-token".to_owned()), false);
+        let app = test_app(state);
+
+        // ::ffff:127.0.0.1 is what arrives when binding on [::] and a client connects via IPv4
+        let mapped_loopback: SocketAddr = "[::ffff:127.0.0.1]:12345".parse().unwrap();
+        let response = oneshot_with_addr(app, mapped_loopback, make_request("/test")).await;
 
         assert_eq!(response.status(), StatusCode::OK);
     }
