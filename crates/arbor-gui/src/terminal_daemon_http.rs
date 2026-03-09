@@ -604,7 +604,7 @@ impl HttpEndpoint {
             );
             match TcpStream::connect_timeout(socket_addr, CONNECT_TIMEOUT) {
                 Ok(stream) => {
-                    tracing::info!(
+                    tracing::debug!(
                         addr = %socket_addr,
                         host = %self.host,
                         "connected to daemon"
