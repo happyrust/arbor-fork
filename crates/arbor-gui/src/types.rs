@@ -1,7 +1,7 @@
 use {
     crate::{
         checkout::CheckoutKind,
-        github_service,
+        github_service::{self, DiffSide},
         terminal_backend::{TerminalCursor, TerminalModes, TerminalStyledLine},
         terminal_daemon_http,
         terminal_runtime::SharedTerminalRuntime,
@@ -367,12 +367,36 @@ pub(crate) struct FileTreeEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangesViewMode {
+    Local,
+    PrChanges,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PrChangedFile {
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffLineKind {
     FileHeader,
     Context,
     Added,
     Removed,
     Modified,
+    Comment,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CommentMeta {
+    #[allow(dead_code)]
+    pub(crate) author: String,
+    pub(crate) is_resolved: bool,
+    #[allow(dead_code)]
+    pub(crate) thread_id: String,
+    #[allow(dead_code)]
+    pub(crate) comment_id: u64,
+    pub(crate) is_header: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +406,7 @@ pub(crate) struct DiffLine {
     pub(crate) left_text: String,
     pub(crate) right_text: String,
     pub(crate) kind: DiffLineKind,
+    pub(crate) comment_meta: Option<CommentMeta>,
 }
 
 #[derive(Debug, Clone)]
@@ -808,4 +833,16 @@ pub(crate) struct RemoteDaemonState {
 pub(crate) struct ActiveRemoteWorktree {
     pub(crate) daemon_index: usize,
     pub(crate) worktree_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingComment {
+    #[allow(dead_code)]
+    pub(crate) session_id: u64,
+    pub(crate) file_path: PathBuf,
+    pub(crate) line: usize,
+    pub(crate) side: DiffSide,
+    pub(crate) text: String,
+    pub(crate) text_cursor: usize,
+    pub(crate) submitting: bool,
 }

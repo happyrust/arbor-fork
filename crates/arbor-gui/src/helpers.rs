@@ -1305,6 +1305,7 @@ impl Render for ArborWindow {
             .on_action(cx.listener(Self::action_open_manage_repo_presets))
             .on_action(cx.listener(Self::action_refresh_worktrees))
             .on_action(cx.listener(Self::action_refresh_changes))
+            .on_action(cx.listener(Self::action_refresh_review_comments))
             .on_action(cx.listener(Self::action_open_add_repository))
             .on_action(cx.listener(Self::action_open_create_worktree))
             .on_action(cx.listener(Self::action_use_embedded_backend))
@@ -2027,6 +2028,7 @@ pub(crate) fn build_worktree_diff_document(
             ),
             right_text: String::new(),
             kind: DiffLineKind::FileHeader,
+            comment_meta: None,
         });
 
         let file_lines = build_file_diff_lines(
@@ -2041,6 +2043,7 @@ pub(crate) fn build_worktree_diff_document(
                 left_text: "  no textual changes".to_owned(),
                 right_text: String::new(),
                 kind: DiffLineKind::Context,
+                comment_meta: None,
             });
         } else {
             lines.extend(file_lines);
@@ -2110,6 +2113,159 @@ pub(crate) fn read_worktree_file_bytes(
             absolute.display()
         )),
     }
+}
+
+/// Read a file's bytes at an arbitrary git ref (e.g. a merge-base OID or branch name).
+pub(crate) fn read_git_ref_file_bytes(
+    worktree_path: &Path,
+    file_path: &Path,
+    git_ref: &str,
+) -> Result<Vec<u8>, String> {
+    let relative = git_relative_path(file_path)?;
+    let object_spec = format!("{git_ref}:{relative}");
+
+    let repo = gix::open(worktree_path).map_err(|error| {
+        format!(
+            "failed to open repository at `{}`: {error}",
+            worktree_path.display()
+        )
+    })?;
+
+    let object_id = match repo.rev_parse_single(object_spec.as_str()) {
+        Ok(id) => id,
+        Err(_) => return Ok(Vec::new()), // file does not exist at this ref
+    };
+
+    let object = object_id.object().map_err(|error| {
+        format!(
+            "failed to read `{relative}` at {git_ref} in `{}`: {error}",
+            worktree_path.display()
+        )
+    })?;
+
+    Ok(object.data.to_vec())
+}
+
+/// Fetch the list of files changed in a PR using `gh pr diff --name-only`.
+pub(crate) fn fetch_pr_changed_files(
+    repo_slug: &str,
+    pr_number: u64,
+    token: Option<&str>,
+) -> Result<Vec<PrChangedFile>, String> {
+    let token = token.ok_or_else(|| "GitHub token not available".to_owned())?;
+
+    let config = ureq::config::Config::builder()
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+
+    let url =
+        format!("https://api.github.com/repos/{repo_slug}/pulls/{pr_number}/files?per_page=100");
+
+    let response = agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("User-Agent", "Arbor")
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("GitHub REST request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.into_body().read_to_string().unwrap_or_default();
+        return Err(format!("GitHub REST returned {status}: {text}"));
+    }
+
+    let text = response
+        .into_body()
+        .read_to_string()
+        .map_err(|e| format!("failed to read PR files response: {e}"))?;
+
+    #[derive(serde::Deserialize)]
+    struct PrFile {
+        filename: String,
+    }
+
+    let files: Vec<PrFile> =
+        serde_json::from_str(&text).map_err(|e| format!("failed to parse PR files: {e}"))?;
+
+    Ok(files
+        .into_iter()
+        .map(|f| PrChangedFile {
+            path: PathBuf::from(f.filename),
+        })
+        .collect())
+}
+
+/// Compute the merge-base between `origin/{base_ref}` and `HEAD`.
+pub(crate) fn compute_merge_base(
+    worktree_path: &Path,
+    base_ref_name: &str,
+) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["merge-base", &format!("origin/{base_ref_name}"), "HEAD"])
+        .current_dir(worktree_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run `git merge-base`: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git merge-base failed: {stderr}"));
+    }
+
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if oid.is_empty() {
+        return Err("git merge-base returned empty output".to_owned());
+    }
+
+    Ok(oid)
+}
+
+/// Build a diff document for PR changes (merge_base..HEAD).
+pub(crate) fn build_pr_diff_document(
+    worktree_path: &Path,
+    pr_files: &[PrChangedFile],
+    merge_base: &str,
+) -> Result<(Vec<DiffLine>, HashMap<PathBuf, usize>), String> {
+    let mut lines = Vec::new();
+    let mut file_row_indices = HashMap::new();
+
+    for file in pr_files {
+        file_row_indices.insert(file.path.clone(), lines.len());
+        lines.push(DiffLine {
+            left_line_number: None,
+            right_line_number: None,
+            left_text: format!("  {}", file.path.display()),
+            right_text: String::new(),
+            kind: DiffLineKind::FileHeader,
+            comment_meta: None,
+        });
+
+        let before_bytes = read_git_ref_file_bytes(worktree_path, &file.path, merge_base)?;
+        let after_bytes = read_git_ref_file_bytes(worktree_path, &file.path, "HEAD")?;
+
+        let before_text = String::from_utf8_lossy(&before_bytes).into_owned();
+        let after_text = String::from_utf8_lossy(&after_bytes).into_owned();
+
+        let file_lines = build_side_by_side_diff_lines(&before_text, &after_text);
+        if file_lines.is_empty() {
+            lines.push(DiffLine {
+                left_line_number: None,
+                right_line_number: None,
+                left_text: "  no textual changes".to_owned(),
+                right_text: String::new(),
+                kind: DiffLineKind::Context,
+                comment_meta: None,
+            });
+        } else {
+            lines.extend(file_lines);
+        }
+    }
+
+    Ok((lines, file_row_indices))
 }
 
 pub(crate) fn git_relative_path(file_path: &Path) -> Result<String, String> {
@@ -2276,6 +2432,7 @@ pub(crate) fn push_collapsed_gap_line(
         left_text: format!("… {hidden_before_count} unchanged lines hidden"),
         right_text: format!("… {hidden_after_count} unchanged lines hidden"),
         kind: DiffLineKind::Context,
+        comment_meta: None,
     });
 }
 
@@ -2344,7 +2501,283 @@ pub(crate) fn push_diff_line(
             .map(|index| rope_display_line(after_rope, index))
             .unwrap_or_default(),
         kind,
+        comment_meta: None,
     });
+}
+
+/// Inject review comment rows into a diff document after the matching diff lines.
+///
+/// For each `ReviewThread`, finds the diff line with a matching line number
+/// and inserts `DiffLineKind::Comment` rows immediately after it.
+pub(crate) fn inject_review_comments(
+    lines: &mut Vec<DiffLine>,
+    file_row_indices: &mut HashMap<PathBuf, usize>,
+    threads: &[github_service::ReviewThread],
+) {
+    if threads.is_empty() {
+        return;
+    }
+
+    // Group threads by file path, then sort by line number descending so that
+    // insertions don't shift indices for earlier insertions.
+    let mut threads_by_file: HashMap<&str, Vec<&github_service::ReviewThread>> = HashMap::new();
+    for thread in threads {
+        threads_by_file
+            .entry(thread.path.as_str())
+            .or_default()
+            .push(thread);
+    }
+
+    // Sort each file's threads by line descending (so we insert from bottom up)
+    for file_threads in threads_by_file.values_mut() {
+        file_threads.sort_by(|a, b| b.line.unwrap_or(0).cmp(&a.line.unwrap_or(0)));
+    }
+
+    for (file_path, file_threads) in &threads_by_file {
+        let file_path_buf = PathBuf::from(file_path);
+
+        // Find the range of diff lines belonging to this file
+        let file_start = file_row_indices.get(&file_path_buf).copied();
+        let file_start = match file_start {
+            Some(start) => start,
+            None => continue,
+        };
+
+        for thread in file_threads {
+            let target_line = match thread.line {
+                Some(l) => l,
+                None => continue, // outdated thread with no line mapping
+            };
+
+            // Find the diff line matching this target_line on the right side
+            let insert_after = lines[file_start..]
+                .iter()
+                .enumerate()
+                .find(|(_, diff_line)| {
+                    // Match on the right line number (RIGHT side) for most comments
+                    if thread.side == github_service::DiffSide::Right {
+                        diff_line.right_line_number == Some(target_line)
+                    } else {
+                        diff_line.left_line_number == Some(target_line)
+                    }
+                })
+                .map(|(offset, _)| file_start + offset);
+
+            let insert_pos = match insert_after {
+                Some(pos) => pos + 1,
+                None => continue, // line not visible in diff
+            };
+
+            // Build comment rows for this thread (reversed because we prepend)
+            let mut comment_rows = Vec::new();
+            for comment in &thread.comments {
+                // Header row: icon + author + timestamp
+                comment_rows.push(DiffLine {
+                    left_line_number: None,
+                    right_line_number: None,
+                    left_text: format!(
+                        "{} \u{b7} {}",
+                        comment.author,
+                        format_iso_relative_time(&comment.created_at)
+                    ),
+                    right_text: String::new(),
+                    kind: DiffLineKind::Comment,
+                    comment_meta: Some(CommentMeta {
+                        author: comment.author.clone(),
+                        is_resolved: thread.is_resolved,
+                        thread_id: thread.id.clone(),
+                        comment_id: comment.id,
+                        is_header: true,
+                    }),
+                });
+
+                // Body rows: each line of the comment body becomes a row
+                for body_line in comment.body.lines() {
+                    comment_rows.push(DiffLine {
+                        left_line_number: None,
+                        right_line_number: None,
+                        left_text: format!("    {body_line}"),
+                        right_text: String::new(),
+                        kind: DiffLineKind::Comment,
+                        comment_meta: Some(CommentMeta {
+                            author: comment.author.clone(),
+                            is_resolved: thread.is_resolved,
+                            thread_id: thread.id.clone(),
+                            comment_id: comment.id,
+                            is_header: false,
+                        }),
+                    });
+                }
+            }
+
+            let row_count = comment_rows.len();
+
+            // Splice comment rows into the lines vec
+            lines.splice(insert_pos..insert_pos, comment_rows);
+
+            // Shift file_row_indices for files whose start is after insert_pos
+            for index in file_row_indices.values_mut() {
+                if *index >= insert_pos {
+                    *index += row_count;
+                }
+            }
+        }
+    }
+}
+
+/// Format an ISO 8601 timestamp as a relative time string (e.g. "2h ago", "3d ago").
+fn format_iso_relative_time(iso_timestamp: &str) -> String {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let timestamp_secs = parse_iso8601_to_unix(iso_timestamp).unwrap_or(now_secs);
+    let delta = now_secs.saturating_sub(timestamp_secs);
+
+    if delta < 60 {
+        "just now".to_owned()
+    } else if delta < 3600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86400 {
+        format!("{}h ago", delta / 3600)
+    } else {
+        format!("{}d ago", delta / 86400)
+    }
+}
+
+fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
+    // Expects "YYYY-MM-DDTHH:MM:SSZ" or similar
+    let s = s.trim().trim_end_matches('Z');
+    let (date_part, time_part) = s.split_once('T')?;
+    let mut date_iter = date_part.split('-');
+    let year: i64 = date_iter.next()?.parse().ok()?;
+    let month: u64 = date_iter.next()?.parse().ok()?;
+    let day: u64 = date_iter.next()?.parse().ok()?;
+
+    let time_part = time_part.split('+').next().unwrap_or(time_part);
+    let mut time_iter = time_part.split(':');
+    let hour: u64 = time_iter.next()?.parse().ok()?;
+    let min: u64 = time_iter.next()?.parse().ok()?;
+    let sec: u64 = time_iter
+        .next()
+        .and_then(|s| s.split('.').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // Days from year 1970 to this year (simplified, no leap second accuracy needed)
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap_year(y) {
+            366
+        } else {
+            365
+        };
+    }
+
+    let month_days = [
+        31,
+        28 + i64::from(is_leap_year(year)),
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    for m in 0..(month as usize).saturating_sub(1) {
+        days += month_days.get(m).copied().unwrap_or(30);
+    }
+    days += day as i64 - 1;
+
+    Some((days as u64) * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Write a `.arbor/pr-comments.md` file into the worktree for AI tools to consume.
+pub(crate) fn write_pr_comments_markdown(
+    worktree_path: &Path,
+    threads: &[github_service::ReviewThread],
+    pr_number: u64,
+    pr_url: &str,
+) {
+    let arbor_dir = worktree_path.join(".arbor");
+    if let Err(e) = fs::create_dir_all(&arbor_dir) {
+        tracing::warn!(
+            "failed to create .arbor directory at {}: {e}",
+            arbor_dir.display()
+        );
+        return;
+    }
+
+    // Ensure .arbor is gitignored
+    let gitignore_path = arbor_dir.join(".gitignore");
+    if !gitignore_path.exists() {
+        let _ = fs::write(&gitignore_path, "*\n");
+    }
+
+    let mut md = String::new();
+    md.push_str(&format!("# PR #{pr_number} Review Comments\n\n"));
+    md.push_str(&format!("Source: {pr_url}\n\n"));
+
+    // Group threads by file path
+    let mut threads_by_file: std::collections::BTreeMap<&str, Vec<&github_service::ReviewThread>> =
+        std::collections::BTreeMap::new();
+    for thread in threads {
+        threads_by_file
+            .entry(thread.path.as_str())
+            .or_default()
+            .push(thread);
+    }
+
+    for (file_path, file_threads) in &threads_by_file {
+        md.push_str(&format!("## {file_path}\n\n"));
+
+        for thread in file_threads {
+            let line_label = thread
+                .line
+                .map(|l| format!("Line {l}"))
+                .unwrap_or_else(|| "outdated".to_owned());
+            let side_label = match thread.side {
+                github_service::DiffSide::Left => "LEFT",
+                github_service::DiffSide::Right => "RIGHT",
+            };
+            let resolved_label = if thread.is_resolved {
+                " [RESOLVED]"
+            } else {
+                ""
+            };
+
+            for (i, comment) in thread.comments.iter().enumerate() {
+                if i == 0 {
+                    md.push_str(&format!(
+                        "### {line_label} ({side_label}) - @{}{resolved_label}\n",
+                        comment.author
+                    ));
+                } else {
+                    md.push_str(&format!("#### Reply - @{}\n", comment.author));
+                }
+                for body_line in comment.body.lines() {
+                    md.push_str(&format!("> {body_line}\n"));
+                }
+                md.push('\n');
+            }
+
+            md.push_str("---\n\n");
+        }
+    }
+
+    let comments_path = arbor_dir.join("pr-comments.md");
+    if let Err(e) = fs::write(&comments_path, &md) {
+        tracing::warn!("failed to write {}: {e}", comments_path.display());
+    }
 }
 
 pub(crate) fn rope_display_line(rope: &Rope, line_index: usize) -> String {
@@ -2781,12 +3214,48 @@ pub(crate) fn render_file_view_session(
         .child(body)
 }
 
+/// Reverse lookup: find the file whose start row is <= `row_index` and is
+/// the maximum such value. Returns the file path.
+pub(crate) fn file_path_for_diff_row(
+    file_row_indices: &HashMap<PathBuf, usize>,
+    row_index: usize,
+) -> Option<PathBuf> {
+    file_row_indices
+        .iter()
+        .filter(|(_, start)| **start <= row_index)
+        .max_by_key(|(_, start)| **start)
+        .map(|(path, _)| path.clone())
+}
+
+/// Runs `git rev-parse HEAD` to get the commit SHA for posting review comments.
+pub(crate) fn head_commit_sha(worktree_path: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(worktree_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run git rev-parse: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git rev-parse HEAD failed: {stderr}"));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 pub(crate) fn render_diff_session(
     session: DiffSession,
     theme: ThemePalette,
     scroll_handle: &UniformListScrollHandle,
     mono_font: gpui::Font,
     diff_cell_width: f32,
+    on_comment_click: Option<Arc<dyn Fn(usize, usize, &mut App) + 'static>>,
+    pending_comment: Option<&PendingComment>,
+    on_comment_submit: Option<Arc<dyn Fn(&mut App) + 'static>>,
+    on_comment_cancel: Option<Arc<dyn Fn(&mut App) + 'static>>,
 ) -> Div {
     let path_label = truncate_middle_text(&session.title, 84);
     let line_count = session.lines.len();
@@ -2852,6 +3321,7 @@ pub(crate) fn render_diff_session(
                     let zonemap_lines = lines.clone();
                     let scroll_handle = scroll_handle.clone();
                     let mono_font = mono_font.clone();
+                    let on_comment_click = on_comment_click.clone();
                     this.child(
                         div()
                             .size_full()
@@ -2871,6 +3341,7 @@ pub(crate) fn render_diff_session(
                                                     theme,
                                                     mono_font.clone(),
                                                     diff_cell_width,
+                                                    on_comment_click.clone(),
                                                 )
                                             })
                                             .collect::<Vec<_>>()
@@ -2885,6 +3356,83 @@ pub(crate) fn render_diff_session(
                     )
                 }),
         )
+        .when_some(pending_comment.cloned(), |this, pc| {
+            let label = format!("{}:{}", pc.file_path.display(), pc.line);
+            let submit_cb = on_comment_submit.clone();
+            let cancel_cb = on_comment_cancel.clone();
+            this.child(
+                div()
+                    .flex_none()
+                    .h(px(36.))
+                    .w_full()
+                    .border_t_1()
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.panel_bg))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .child(active_input_display(
+                                theme,
+                                &pc.text,
+                                "Add a comment...",
+                                theme.text_primary,
+                                pc.text_cursor,
+                                120,
+                            )),
+                    )
+                    .child(
+                        action_button(
+                            theme,
+                            "comment-submit",
+                            if pc.submitting {
+                                "Posting..."
+                            } else {
+                                "Submit"
+                            },
+                            ActionButtonStyle::Primary,
+                            !pc.text.trim().is_empty() && !pc.submitting,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |_, _, app| {
+                                if let Some(cb) = &submit_cb {
+                                    cb(app);
+                                }
+                            },
+                        ),
+                    )
+                    .child(
+                        action_button(
+                            theme,
+                            "comment-cancel",
+                            "Cancel",
+                            ActionButtonStyle::Secondary,
+                            !pc.submitting,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |_, _, app| {
+                                if let Some(cb) = &cancel_cb {
+                                    cb(app);
+                                }
+                            },
+                        ),
+                    ),
+            )
+        })
 }
 
 pub(crate) fn render_diff_row(
@@ -2894,6 +3442,7 @@ pub(crate) fn render_diff_row(
     theme: ThemePalette,
     mono_font: gpui::Font,
     diff_cell_width: f32,
+    on_comment_click: Option<Arc<dyn Fn(usize, usize, &mut App) + 'static>>,
 ) -> impl IntoElement {
     if line.kind == DiffLineKind::FileHeader {
         return div()
@@ -2921,11 +3470,65 @@ pub(crate) fn render_diff_row(
             );
     }
 
+    if line.kind == DiffLineKind::Comment {
+        let is_resolved = line.comment_meta.as_ref().is_some_and(|m| m.is_resolved);
+        let is_header = line.comment_meta.as_ref().is_some_and(|m| m.is_header);
+        let bg = if is_resolved {
+            DIFF_COMMENT_RESOLVED_BG
+        } else {
+            DIFF_COMMENT_BG
+        };
+        let text_color = if is_resolved {
+            DIFF_COMMENT_RESOLVED_TEXT_COLOR
+        } else {
+            DIFF_COMMENT_TEXT_COLOR
+        };
+
+        return div()
+            .id(diff_row_element_id(
+                "diff-row-comment",
+                session_id,
+                row_index,
+            ))
+            .w_full()
+            .h(px(DIFF_ROW_HEIGHT_PX))
+            .min_h(px(DIFF_ROW_HEIGHT_PX))
+            .bg(rgb(bg))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(is_header, |this| {
+                this.child(
+                    svg()
+                        .path("icons/ui/comment-muted.svg")
+                        .size(px(14.))
+                        .flex_none(),
+                )
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .font(mono_font)
+                    .text_size(px(DIFF_FONT_SIZE_PX))
+                    .whitespace_nowrap()
+                    .text_color(rgb(if is_header {
+                        DIFF_COMMENT_AUTHOR_COLOR
+                    } else {
+                        text_color
+                    }))
+                    .when(is_resolved, |this| this.italic())
+                    .child(line.left_text),
+            );
+    }
+
     let (left_bg, right_bg) = diff_line_backgrounds(line.kind, theme);
     let (left_marker, right_marker) = diff_line_markers(line.kind);
     let (left_text_color, right_text_color) = diff_line_text_colors(line.kind, theme);
     div()
         .id(diff_row_element_id("diff-row", session_id, row_index))
+        .group("diff-row")
         .w_full()
         .min_w_0()
         .h(px(DIFF_ROW_HEIGHT_PX))
@@ -2943,6 +3546,7 @@ pub(crate) fn render_diff_row(
             theme,
             mono_font.clone(),
             diff_cell_width,
+            on_comment_click.clone(),
         ))
         .child(render_diff_column(
             session_id,
@@ -2956,6 +3560,7 @@ pub(crate) fn render_diff_row(
             theme,
             mono_font,
             diff_cell_width,
+            on_comment_click,
         ))
 }
 
@@ -2971,12 +3576,19 @@ pub(crate) fn render_diff_column(
     theme: ThemePalette,
     mono_font: gpui::Font,
     diff_cell_width: f32,
+    on_comment_click: Option<Arc<dyn Fn(usize, usize, &mut App) + 'static>>,
 ) -> impl IntoElement {
     let number_width = px((DIFF_LINE_NUMBER_WIDTH_CHARS as f32 * diff_cell_width) + 12.);
 
     let column_id = diff_row_side_element_id("diff-column", session_id, row_index, side);
     let marker_id = diff_row_side_element_id("diff-marker", session_id, row_index, side);
     let text_id = diff_row_side_element_id("diff-text", session_id, row_index, side);
+    let plus_id = diff_row_side_element_id("diff-plus", session_id, row_index, side);
+
+    let show_plus = on_comment_click.is_some() && line_number.is_some();
+
+    let dblclick_cb = on_comment_click.clone();
+    let has_dblclick = dblclick_cb.is_some() && line_number.is_some();
 
     div()
         .id(column_id)
@@ -2984,6 +3596,15 @@ pub(crate) fn render_diff_column(
         .min_w_0()
         .h_full()
         .bg(rgb(background))
+        .when(has_dblclick, |this| {
+            this.on_mouse_down(MouseButton::Left, move |event, _, app| {
+                if event.click_count == 2
+                    && let Some(cb) = &dblclick_cb
+                {
+                    cb(row_index, side, app);
+                }
+            })
+        })
         .child(
             div()
                 .h_full()
@@ -2996,10 +3617,44 @@ pub(crate) fn render_diff_column(
                     div()
                         .w(number_width)
                         .flex_none()
-                        .text_right()
-                        .text_size(px(DIFF_FONT_SIZE_PX))
-                        .text_color(rgb(theme.text_disabled))
-                        .child(line_number.map_or(String::new(), |line| line.to_string())),
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
+                        .child(if show_plus {
+                            let cb = on_comment_click.clone();
+                            div()
+                                .id(plus_id)
+                                .flex_none()
+                                .w(px(14.))
+                                .h(px(14.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(10.))
+                                .text_color(rgb(theme.text_muted))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .opacity(0.)
+                                .group_hover("diff-row", |s| {
+                                    s.opacity(1.).bg(rgb(theme.panel_active_bg))
+                                })
+                                .child("+")
+                                .on_mouse_down(MouseButton::Left, move |_, _, app| {
+                                    if let Some(cb) = &cb {
+                                        cb(row_index, side, app);
+                                    }
+                                })
+                        } else {
+                            div().id(plus_id).flex_none().w(px(14.))
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_right()
+                                .text_size(px(DIFF_FONT_SIZE_PX))
+                                .text_color(rgb(theme.text_disabled))
+                                .child(line_number.map_or(String::new(), |line| line.to_string())),
+                        ),
                 )
                 .child(
                     div()
@@ -3215,13 +3870,14 @@ pub(crate) fn zonemap_marker_color(kind: DiffLineKind) -> Option<u32> {
         DiffLineKind::Added => Some(0x72d69c),
         DiffLineKind::Removed => Some(0xeb6f92),
         DiffLineKind::Modified => Some(0xf9e2af),
-        DiffLineKind::Context => None,
+        DiffLineKind::Context | DiffLineKind::Comment => None,
     }
 }
 
 pub(crate) fn diff_line_backgrounds(kind: DiffLineKind, theme: ThemePalette) -> (u32, u32) {
     match kind {
         DiffLineKind::FileHeader => (theme.tab_active_bg, theme.tab_active_bg),
+        DiffLineKind::Comment => (DIFF_COMMENT_BG, DIFF_COMMENT_BG),
         DiffLineKind::Context
         | DiffLineKind::Added
         | DiffLineKind::Removed
@@ -3236,12 +3892,13 @@ pub(crate) fn diff_line_text_colors(kind: DiffLineKind, theme: ThemePalette) -> 
         DiffLineKind::Added => (theme.text_disabled, 0x8fd7ad),
         DiffLineKind::Removed => (0xf2a4b7, theme.text_disabled),
         DiffLineKind::Modified => (0xf2a4b7, 0x8fd7ad),
+        DiffLineKind::Comment => (DIFF_COMMENT_TEXT_COLOR, DIFF_COMMENT_TEXT_COLOR),
     }
 }
 
 pub(crate) fn diff_line_markers(kind: DiffLineKind) -> (char, char) {
     match kind {
-        DiffLineKind::FileHeader => (' ', ' '),
+        DiffLineKind::FileHeader | DiffLineKind::Comment => (' ', ' '),
         DiffLineKind::Context => (' ', ' '),
         DiffLineKind::Added => (' ', '+'),
         DiffLineKind::Removed => ('-', ' '),
@@ -3284,15 +3941,21 @@ pub(crate) fn wrap_diff_document_lines(
 
 pub(crate) fn wrap_diff_line(line: DiffLine, wrap_columns: usize) -> Vec<DiffLine> {
     let wrap_columns = wrap_columns.max(1);
-    if line.kind == DiffLineKind::FileHeader {
+    if line.kind == DiffLineKind::FileHeader || line.kind == DiffLineKind::Comment {
         return split_diff_text_chunks(line.left_text, wrap_columns.saturating_mul(2))
             .into_iter()
-            .map(|chunk| DiffLine {
+            .enumerate()
+            .map(|(i, chunk)| DiffLine {
                 left_line_number: None,
                 right_line_number: None,
                 left_text: chunk,
                 right_text: String::new(),
-                kind: DiffLineKind::FileHeader,
+                kind: line.kind,
+                comment_meta: if i == 0 {
+                    line.comment_meta.clone()
+                } else {
+                    None
+                },
             })
             .collect();
     }
@@ -3309,6 +3972,7 @@ pub(crate) fn wrap_diff_line(line: DiffLine, wrap_columns: usize) -> Vec<DiffLin
             left_text: left_chunks.get(index).cloned().unwrap_or_default(),
             right_text: right_chunks.get(index).cloned().unwrap_or_default(),
             kind: line.kind,
+            comment_meta: None,
         });
     }
 

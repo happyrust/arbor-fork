@@ -5,6 +5,7 @@ mod connection_history;
 mod constants;
 mod github_auth_store;
 mod github_service;
+mod graphql;
 mod helpers;
 mod log_layer;
 #[cfg(feature = "mdns")]
@@ -178,6 +179,10 @@ struct ArborWindow {
     ui_state_store: Box<dyn ui_state_store::UiStateStore>,
     github_auth_store: Box<dyn github_auth_store::GithubAuthStore>,
     github_service: Arc<dyn github_service::GitHubService>,
+    review_service: Arc<dyn github_service::GitHubReviewService>,
+    github_token_shared: Arc<std::sync::RwLock<Option<String>>>,
+    review_threads: HashMap<PathBuf, Vec<github_service::ReviewThread>>,
+    review_threads_loading: bool,
     github_auth_state: github_auth_store::GithubAuthState,
     github_auth_in_progress: bool,
     github_auth_copy_feedback_active: bool,
@@ -194,11 +199,16 @@ struct ArborWindow {
     worktree_selection_epoch: usize,
     changed_files: Vec<ChangedFile>,
     selected_changed_file: Option<PathBuf>,
+    changes_view_mode: ChangesViewMode,
+    pr_changed_files: Vec<PrChangedFile>,
+    pr_merge_base: Option<String>,
+    pr_changed_files_loading: bool,
     terminals: Vec<TerminalSession>,
     terminal_poll_tx: std::sync::mpsc::Sender<()>,
     terminal_poll_rx: Option<std::sync::mpsc::Receiver<()>>,
     diff_sessions: Vec<DiffSession>,
     active_diff_session_id: Option<u64>,
+    pending_comment: Option<PendingComment>,
     file_view_sessions: Vec<FileViewSession>,
     active_file_view_session_id: Option<u64>,
     next_file_view_session_id: u64,
@@ -332,6 +342,15 @@ impl ArborWindow {
         let ui_state_store = ui_state_store::default_ui_state_store();
         let github_auth_store = github_auth_store::default_github_auth_store();
         let github_service = github_service::default_github_service();
+        let github_token_shared: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let token_shared_clone = github_token_shared.clone();
+        let review_service = github_service::default_review_service(Arc::new(move || {
+            token_shared_clone
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+        }));
         let notification_service = notifications::default_notification_service();
         let loaded_github_auth_state = github_auth_store.load();
         let config_path = app_config_store.config_path();
@@ -428,6 +447,10 @@ impl ArborWindow {
                     ui_state_store,
                     github_auth_store,
                     github_service,
+                    review_service: review_service.clone(),
+                    github_token_shared: github_token_shared.clone(),
+                    review_threads: HashMap::new(),
+                    review_threads_loading: false,
                     github_auth_state,
                     github_auth_in_progress: false,
                     github_auth_copy_feedback_active: false,
@@ -444,11 +467,16 @@ impl ArborWindow {
                     worktree_selection_epoch: 0,
                     changed_files: Vec::new(),
                     selected_changed_file: None,
+                    changes_view_mode: ChangesViewMode::Local,
+                    pr_changed_files: Vec::new(),
+                    pr_merge_base: None,
+                    pr_changed_files_loading: false,
                     terminals: Vec::new(),
                     terminal_poll_tx,
                     terminal_poll_rx: Some(terminal_poll_rx),
                     diff_sessions: Vec::new(),
                     active_diff_session_id: None,
+                    pending_comment: None,
                     file_view_sessions: Vec::new(),
                     active_file_view_session_id: None,
                     next_file_view_session_id: 1,
@@ -756,6 +784,10 @@ impl ArborWindow {
             ui_state_store,
             github_auth_store,
             github_service,
+            review_service,
+            github_token_shared: github_token_shared.clone(),
+            review_threads: HashMap::new(),
+            review_threads_loading: false,
             github_auth_state,
             github_auth_in_progress: false,
             github_auth_copy_feedback_active: false,
@@ -776,11 +808,16 @@ impl ArborWindow {
             worktree_selection_epoch: 0,
             changed_files: Vec::new(),
             selected_changed_file: None,
+            changes_view_mode: ChangesViewMode::Local,
+            pr_changed_files: Vec::new(),
+            pr_merge_base: None,
+            pr_changed_files_loading: false,
             terminals: Vec::new(),
             terminal_poll_tx,
             terminal_poll_rx: Some(terminal_poll_rx),
             diff_sessions: Vec::new(),
             active_diff_session_id: None,
+            pending_comment: None,
             file_view_sessions: Vec::new(),
             active_file_view_session_id: None,
             next_file_view_session_id: 1,
@@ -1772,6 +1809,7 @@ impl ArborWindow {
             ));
         }
 
+        self.sync_github_token_shared();
         self.refresh_worktree_diff_summaries(cx);
         self.refresh_agent_tasks(cx);
         self.refresh_worktree_pull_requests(cx);
@@ -2130,9 +2168,12 @@ impl ArborWindow {
                     tracked_branches
                         .into_iter()
                         .map(|(path, branch, repo_slug)| {
-                            // Try gh CLI first for rich details
                             let details = repo_slug.as_ref().and_then(|slug| {
-                                github_service::pull_request_details(slug, &branch)
+                                github_service::pull_request_details(
+                                    slug,
+                                    &branch,
+                                    github_token.as_deref(),
+                                )
                             });
 
                             let (pr_number, pr_url) = if let Some(ref d) = details {
@@ -2195,7 +2236,495 @@ impl ArborWindow {
 
                 if changed {
                     cx.notify();
+                    // Auto-fetch review comments for the active worktree after PR refresh
+                    this.refresh_review_threads_for_worktree(cx);
                 }
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_review_threads_for_worktree(&mut self, cx: &mut Context<Self>) {
+        if self.review_threads_loading {
+            return;
+        }
+
+        let worktree = match self.active_worktree() {
+            Some(w) => w,
+            None => return,
+        };
+
+        let pr_number = match worktree.pr_number {
+            Some(n) => n,
+            None => return,
+        };
+
+        let repo_slug = match self.github_repo_slug.clone() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let worktree_path = worktree.path.clone();
+        let pr_url = worktree
+            .pr_url
+            .clone()
+            .unwrap_or_else(|| format!("https://github.com/{repo_slug}/pull/{pr_number}"));
+        let review_service = self.review_service.clone();
+
+        self.review_threads_loading = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    review_service.fetch_review_threads(&repo_slug, pr_number)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.review_threads_loading = false;
+
+                match result {
+                    Ok(threads) => {
+                        // Write markdown export
+                        write_pr_comments_markdown(&worktree_path, &threads, pr_number, &pr_url);
+
+                        this.review_threads.insert(worktree_path.clone(), threads);
+
+                        // Re-inject comments into any open diff session for this worktree
+                        this.rebuild_diff_sessions_for_worktree(&worktree_path, cx);
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            "failed to fetch review threads for PR #{pr_number}: {error}"
+                        );
+                    },
+                }
+
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn rebuild_diff_sessions_for_worktree(&mut self, worktree_path: &Path, cx: &mut Context<Self>) {
+        let sessions_to_rebuild: Vec<u64> = self
+            .diff_sessions
+            .iter()
+            .filter(|s| s.worktree_path == worktree_path && !s.is_loading)
+            .map(|s| s.id)
+            .collect();
+
+        for session_id in sessions_to_rebuild {
+            let Some(session) = self.diff_sessions.iter_mut().find(|s| s.id == session_id) else {
+                continue;
+            };
+
+            // Re-build from raw_lines with comment injection
+            let mut lines: Vec<DiffLine> = session.raw_lines.to_vec();
+            let mut file_row_indices = session.raw_file_row_indices.clone();
+
+            // Strip any existing comment rows from raw_lines (they shouldn't be there,
+            // but be defensive)
+            lines.retain(|l| l.kind != DiffLineKind::Comment);
+
+            if let Some(threads) = self.review_threads.get(worktree_path) {
+                inject_review_comments(&mut lines, &mut file_row_indices, threads);
+            }
+
+            let cell_width = diff_cell_width_px(cx);
+            let wrap_columns = self
+                .live_diff_list_width_px()
+                .map(|list_width| {
+                    self.estimated_diff_wrap_columns_for_list_width(list_width, cell_width)
+                })
+                .unwrap_or_else(|| self.estimated_diff_wrap_columns(cell_width));
+
+            let raw_lines = Arc::<[DiffLine]>::from(lines);
+            let (wrapped_lines, wrapped_indices) =
+                wrap_diff_document_lines(raw_lines.as_ref(), &file_row_indices, wrap_columns);
+
+            // Re-borrow the session mutably after self methods
+            let Some(session) = self.diff_sessions.iter_mut().find(|s| s.id == session_id) else {
+                continue;
+            };
+            session.raw_lines = raw_lines;
+            session.raw_file_row_indices = file_row_indices;
+            session.lines = Arc::<[DiffLine]>::from(wrapped_lines);
+            session.file_row_indices = wrapped_indices;
+            session.wrapped_columns = wrap_columns;
+        }
+    }
+
+    fn start_inline_comment(
+        &mut self,
+        session_id: u64,
+        row_index: usize,
+        side: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let session = match self.diff_sessions.iter().find(|s| s.id == session_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let line = match session.lines.get(row_index) {
+            Some(l) => l,
+            None => return,
+        };
+
+        let line_number = if side == 1 {
+            line.right_line_number
+        } else {
+            line.left_line_number
+        };
+
+        let Some(line_number) = line_number else {
+            return;
+        };
+
+        let file_path = match file_path_for_diff_row(&session.file_row_indices, row_index) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let diff_side = if side == 1 {
+            github_service::DiffSide::Right
+        } else {
+            github_service::DiffSide::Left
+        };
+
+        self.pending_comment = Some(PendingComment {
+            session_id,
+            file_path,
+            line: line_number,
+            side: diff_side,
+            text: String::new(),
+            text_cursor: 0,
+            submitting: false,
+        });
+        cx.notify();
+    }
+
+    fn submit_inline_comment(&mut self, cx: &mut Context<Self>) {
+        // Check preconditions and extract values before mutating
+        let pc = match self.pending_comment.as_ref() {
+            Some(pc) if !pc.text.trim().is_empty() && !pc.submitting => pc,
+            _ => return,
+        };
+        let file_path = pc.file_path.display().to_string();
+        let line = pc.line;
+        let side = pc.side;
+        let body = pc.text.clone();
+
+        let worktree = match self.active_worktree() {
+            Some(w) => w,
+            None => return,
+        };
+        let pr_number = match worktree.pr_number {
+            Some(n) => n,
+            None => return,
+        };
+        let repo_slug = match self.github_repo_slug.clone() {
+            Some(s) => s,
+            None => return,
+        };
+        let worktree_path = worktree.path.clone();
+
+        let commit_sha = match head_commit_sha(&worktree_path) {
+            Ok(sha) => sha,
+            Err(error) => {
+                self.notice = Some(format!("failed to get HEAD SHA: {error}"));
+                cx.notify();
+                return;
+            },
+        };
+
+        // Now mark as submitting
+        if let Some(pc) = self.pending_comment.as_mut() {
+            pc.submitting = true;
+        }
+        let review_service = self.review_service.clone();
+
+        cx.spawn(async move |this, cx| {
+            // Keep copies for optimistic injection after the API call
+            let inject_file_path = file_path.clone();
+            let inject_worktree_path = worktree_path.clone();
+            let inject_line = line;
+            let inject_side = side;
+
+            let result = cx
+                .background_spawn(async move {
+                    review_service.post_review_comment(
+                        &repo_slug,
+                        pr_number,
+                        &file_path,
+                        line,
+                        side,
+                        &body,
+                        &commit_sha,
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(posted_comment) => {
+                        this.pending_comment = None;
+
+                        // Optimistically inject the new comment into local
+                        // review threads so it appears immediately without
+                        // waiting for a GraphQL round-trip.
+                        let thread = github_service::ReviewThread {
+                            id: format!("local-{}", posted_comment.id),
+                            path: inject_file_path,
+                            line: Some(inject_line),
+                            start_line: None,
+                            side: inject_side,
+                            is_resolved: false,
+                            is_outdated: false,
+                            comments: vec![posted_comment],
+                        };
+                        this.review_threads
+                            .entry(inject_worktree_path.clone())
+                            .or_default()
+                            .push(thread);
+                        this.rebuild_diff_sessions_for_worktree(&inject_worktree_path, cx);
+
+                        // Also refresh from the server to reconcile
+                        this.refresh_review_threads_for_worktree(cx);
+                    },
+                    Err(error) => {
+                        this.notice = Some(format!("failed to post comment: {error}"));
+                        if let Some(pc) = this.pending_comment.as_mut() {
+                            pc.submitting = false;
+                        }
+                    },
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn cancel_inline_comment(&mut self, cx: &mut Context<Self>) {
+        self.pending_comment = None;
+        cx.notify();
+    }
+
+    fn refresh_pr_changed_files(&mut self, cx: &mut Context<Self>) {
+        if self.pr_changed_files_loading {
+            return;
+        }
+
+        let worktree = match self.active_worktree() {
+            Some(w) => w,
+            None => return,
+        };
+
+        let pr_number = match worktree
+            .pr_details
+            .as_ref()
+            .map(|d| d.number)
+            .or(worktree.pr_number)
+        {
+            Some(n) => n,
+            None => return,
+        };
+
+        let base_ref_name = worktree
+            .pr_details
+            .as_ref()
+            .map(|d| d.base_ref_name.clone())
+            .unwrap_or_else(|| "main".to_owned());
+
+        let repo_slug = match self.github_repo_slug.clone() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let worktree_path = worktree.path.clone();
+        let token = self.github_access_token();
+
+        self.pr_changed_files_loading = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let files = fetch_pr_changed_files(&repo_slug, pr_number, token.as_deref())?;
+                    let merge_base = compute_merge_base(&worktree_path, &base_ref_name)?;
+                    Ok::<_, String>((files, merge_base))
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.pr_changed_files_loading = false;
+
+                match result {
+                    Ok((files, merge_base)) => {
+                        this.pr_changed_files = files;
+                        this.pr_merge_base = Some(merge_base);
+                    },
+                    Err(error) => {
+                        tracing::warn!("failed to fetch PR changed files: {error}");
+                        this.pr_changed_files.clear();
+                        this.pr_merge_base = None;
+                    },
+                }
+
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_pr_diff_tab_for_selected_file(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
+            self.notice = Some("select a worktree before opening a PR diff".to_owned());
+            return;
+        };
+        let Some(merge_base) = self.pr_merge_base.clone() else {
+            self.notice = Some("PR merge-base not available yet".to_owned());
+            return;
+        };
+        let Some(selected_file_path) = self
+            .selected_changed_file
+            .clone()
+            .or_else(|| self.pr_changed_files.first().map(|f| f.path.clone()))
+        else {
+            self.notice = Some("select a PR changed file before opening a diff".to_owned());
+            return;
+        };
+
+        let pr_files = self.pr_changed_files.clone();
+        let (session_id, should_rebuild) = match self
+            .diff_sessions
+            .iter_mut()
+            .find(|session| session.worktree_path == worktree_path)
+        {
+            Some(existing) => {
+                self.active_diff_session_id = Some(existing.id);
+                (
+                    existing.id,
+                    !existing.is_loading
+                        && (existing.lines.is_empty()
+                            || !existing.file_row_indices.contains_key(&selected_file_path)),
+                )
+            },
+            None => {
+                let session_id = self.next_diff_session_id;
+                self.next_diff_session_id = self.next_diff_session_id.saturating_add(1);
+                self.diff_sessions.push(DiffSession {
+                    id: session_id,
+                    worktree_path: worktree_path.clone(),
+                    title: "PR Diff".to_owned(),
+                    raw_lines: Arc::<[DiffLine]>::from(Vec::<DiffLine>::new()),
+                    raw_file_row_indices: HashMap::new(),
+                    lines: Arc::<[DiffLine]>::from(Vec::<DiffLine>::new()),
+                    file_row_indices: HashMap::new(),
+                    wrapped_columns: 0,
+                    is_loading: true,
+                });
+                self.active_diff_session_id = Some(session_id);
+                (session_id, true)
+            },
+        };
+
+        self.pending_diff_scroll_to_file = Some(selected_file_path.clone());
+        if !should_rebuild {
+            let _ = self.scroll_diff_to_file(selected_file_path.as_path());
+            cx.notify();
+            return;
+        }
+
+        if let Some(session) = self
+            .diff_sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            session.is_loading = true;
+            session.title = "PR Diff".to_owned();
+            session.raw_lines = Arc::<[DiffLine]>::from(Vec::<DiffLine>::new());
+            session.raw_file_row_indices.clear();
+            session.lines = Arc::<[DiffLine]>::from(Vec::<DiffLine>::new());
+            session.file_row_indices.clear();
+            session.wrapped_columns = 0;
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let diff_document = cx
+                .background_spawn(async move {
+                    build_pr_diff_document(&worktree_path, &pr_files, &merge_base)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let cell_width = diff_cell_width_px(cx);
+                let wrap_columns = this
+                    .live_diff_list_width_px()
+                    .map(|list_width| {
+                        this.estimated_diff_wrap_columns_for_list_width(list_width, cell_width)
+                    })
+                    .unwrap_or_else(|| this.estimated_diff_wrap_columns(cell_width));
+                let Some(session) = this
+                    .diff_sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                else {
+                    return;
+                };
+
+                match diff_document {
+                    Ok((mut lines, mut file_row_indices)) => {
+                        let worktree_path_key = session.worktree_path.clone();
+                        if let Some(threads) = this.review_threads.get(&worktree_path_key) {
+                            inject_review_comments(&mut lines, &mut file_row_indices, threads);
+                        }
+
+                        let raw_lines = Arc::<[DiffLine]>::from(lines);
+                        let raw_file_row_indices = file_row_indices;
+                        let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
+                            raw_lines.as_ref(),
+                            &raw_file_row_indices,
+                            wrap_columns,
+                        );
+                        session.raw_lines = raw_lines;
+                        session.raw_file_row_indices = raw_file_row_indices;
+                        session.lines = Arc::<[DiffLine]>::from(wrapped_lines);
+                        session.file_row_indices = wrapped_indices;
+                        session.wrapped_columns = wrap_columns;
+                        session.is_loading = false;
+
+                        if let Some(target_path) = this.pending_diff_scroll_to_file.clone()
+                            && this.scroll_diff_to_file(target_path.as_path())
+                        {
+                            this.pending_diff_scroll_to_file = None;
+                        }
+                    },
+                    Err(error) => {
+                        let fallback_lines = Arc::<[DiffLine]>::from(vec![DiffLine {
+                            left_line_number: None,
+                            right_line_number: None,
+                            left_text: format!("failed to build PR diff: {error}"),
+                            right_text: String::new(),
+                            kind: DiffLineKind::FileHeader,
+                            comment_meta: None,
+                        }]);
+                        let fallback_indices = HashMap::new();
+                        let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
+                            fallback_lines.as_ref(),
+                            &fallback_indices,
+                            wrap_columns,
+                        );
+                        session.raw_lines = fallback_lines;
+                        session.raw_file_row_indices = fallback_indices;
+                        session.lines = Arc::<[DiffLine]>::from(wrapped_lines);
+                        session.file_row_indices = wrapped_indices;
+                        session.wrapped_columns = wrap_columns;
+                        session.is_loading = false;
+                    },
+                }
+
+                cx.notify();
             });
         })
         .detach();
@@ -3275,6 +3804,12 @@ impl ArborWindow {
         resolve_github_access_token(self.github_auth_state.access_token.as_deref())
     }
 
+    fn sync_github_token_shared(&self) {
+        if let Ok(mut guard) = self.github_token_shared.write() {
+            *guard = self.github_access_token();
+        }
+    }
+
     fn persist_github_auth_state(&self) -> Result<(), String> {
         self.github_auth_store.save(&self.github_auth_state)
     }
@@ -3293,6 +3828,7 @@ impl ArborWindow {
                 "disconnected, but failed to persist auth state: {error}"
             )),
         };
+        self.sync_github_token_shared();
         self.refresh_worktree_pull_requests(cx);
         cx.notify();
     }
@@ -3401,6 +3937,7 @@ impl ArborWindow {
                                 "GitHub connected, but failed to persist auth state: {error}"
                             )),
                         };
+                        this.sync_github_token_shared();
                         this.refresh_worktree_pull_requests(cx);
                     },
                     Err(error) => {
@@ -3540,6 +4077,9 @@ impl ArborWindow {
         self.active_worktree_index = Some(index);
         self.active_outpost_index = None;
         self.active_diff_session_id = None;
+        self.changes_view_mode = ChangesViewMode::Local;
+        self.pr_changed_files.clear();
+        self.pr_merge_base = None;
         self.sync_active_repository_from_selected_worktree();
         let _ = self.reload_changed_files();
         self.expanded_dirs.clear();
@@ -6410,6 +6950,15 @@ impl ArborWindow {
         cx.notify();
     }
 
+    fn action_refresh_review_comments(
+        &mut self,
+        _: &RefreshReviewComments,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_review_threads_for_worktree(cx);
+    }
+
     fn action_use_embedded_backend(
         &mut self,
         _: &UseEmbeddedBackend,
@@ -7293,7 +7842,13 @@ impl ArborWindow {
                 };
 
                 match diff_document {
-                    Ok((lines, file_row_indices)) => {
+                    Ok((mut lines, mut file_row_indices)) => {
+                        // Inject review comments if available for this worktree
+                        let worktree_path_key = session.worktree_path.clone();
+                        if let Some(threads) = this.review_threads.get(&worktree_path_key) {
+                            inject_review_comments(&mut lines, &mut file_row_indices, threads);
+                        }
+
                         let raw_lines = Arc::<[DiffLine]>::from(lines);
                         let raw_file_row_indices = file_row_indices;
                         let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
@@ -7321,6 +7876,7 @@ impl ArborWindow {
                             left_text: format!("failed to build diff: {error}"),
                             right_text: String::new(),
                             kind: DiffLineKind::FileHeader,
+                            comment_meta: None,
                         }]);
                         let fallback_indices = HashMap::new();
                         let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
@@ -7643,6 +8199,30 @@ impl ArborWindow {
             || self.connect_to_host_modal.is_some()
             || self.show_theme_picker
         {
+            return;
+        }
+
+        if self.pending_comment.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.cancel_inline_comment(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "enter" | "return" => {
+                    self.submit_inline_comment(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                _ => {},
+            }
+            if let Some(action) = text_edit_action_for_event(event, cx) {
+                if let Some(pc) = self.pending_comment.as_mut() {
+                    apply_text_edit_action(&mut pc.text, &mut pc.text_cursor, &action);
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
             return;
         }
 
@@ -11042,12 +11622,58 @@ impl ArborWindow {
                     .when_some(active_diff_session, |this, session| {
                         let mono_font = terminal_mono_font(cx);
                         let diff_cell_width = diff_cell_width_px(cx);
+                        let is_pr_mode =
+                            self.changes_view_mode == ChangesViewMode::PrChanges;
+                        let on_comment_click: Option<
+                            Arc<dyn Fn(usize, usize, &mut App) + 'static>,
+                        > = if is_pr_mode {
+                            let session_id = session.id;
+                            let entity = cx.entity().clone();
+                            Some(Arc::new(
+                                move |row_index: usize, side: usize, app: &mut App| {
+                                    entity.update(app, |this, cx| {
+                                        this.start_inline_comment(
+                                            session_id, row_index, side, cx,
+                                        );
+                                    });
+                                },
+                            ))
+                        } else {
+                            None
+                        };
+                        let pending = self.pending_comment.as_ref();
+                        let on_submit: Option<Arc<dyn Fn(&mut App) + 'static>> =
+                            if pending.is_some() {
+                                let entity = cx.entity().clone();
+                                Some(Arc::new(move |app: &mut App| {
+                                    entity.update(app, |this, cx| {
+                                        this.submit_inline_comment(cx);
+                                    });
+                                }))
+                            } else {
+                                None
+                            };
+                        let on_cancel: Option<Arc<dyn Fn(&mut App) + 'static>> =
+                            if pending.is_some() {
+                                let entity = cx.entity().clone();
+                                Some(Arc::new(move |app: &mut App| {
+                                    entity.update(app, |this, cx| {
+                                        this.cancel_inline_comment(cx);
+                                    });
+                                }))
+                            } else {
+                                None
+                            };
                         this.child(render_diff_session(
                             session,
                             theme,
                             &self.diff_scroll_handle,
                             mono_font,
                             diff_cell_width,
+                            on_comment_click,
+                            pending,
+                            on_submit,
+                            on_cancel,
                         ))
                     })
                     .when_some(active_file_view_session, |this, session| {
@@ -11105,8 +11731,14 @@ impl ArborWindow {
                                     .id("log-copy-all")
                                     .cursor_pointer()
                                     .text_xs()
+                                    .px(px(4.))
+                                    .py(px(1.))
+                                    .rounded_sm()
                                     .text_color(rgb(theme.text_muted))
-                                    .hover(|this| this.text_color(rgb(theme.text_primary)))
+                                    .hover(|this| {
+                                        this.text_color(rgb(theme.text_primary))
+                                            .bg(rgb(theme.panel_active_bg))
+                                    })
                                     .child("Copy All")
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -11334,12 +11966,227 @@ impl ArborWindow {
     fn render_changes_content(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let selected_path = self.selected_changed_file.clone();
+        let has_pr = self
+            .active_worktree()
+            .is_some_and(|w| w.pr_number.is_some());
+        let view_mode = self.changes_view_mode;
+        let is_pr_mode = view_mode == ChangesViewMode::PrChanges;
+
         let can_run_actions = self.can_run_local_git_actions();
         let is_busy = self.git_action_in_flight.is_some();
         let commit_enabled = can_run_actions && !is_busy && !self.changed_files.is_empty();
         let push_enabled = can_run_actions && !is_busy;
         let pr_enabled = can_run_actions && !is_busy;
         let search_lower = self.right_pane_search.to_lowercase();
+
+        // Mode toggle row (only visible when a PR exists)
+        let mode_toggle_row = div()
+            .h(px(28.))
+            .px_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_0()
+            .border_b_1()
+            .border_color(rgb(theme.border))
+            .child(self.render_changes_mode_button(
+                "Local",
+                ChangesViewMode::Local,
+                view_mode,
+                theme,
+                cx,
+            ))
+            .child(self.render_changes_mode_button(
+                "PR",
+                ChangesViewMode::PrChanges,
+                view_mode,
+                theme,
+                cx,
+            ));
+
+        let action_header = div()
+            .h(px(32.))
+            .px_1()
+            .gap_1()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(rgb(theme.border))
+            .when(!is_pr_mode, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            git_action_button(
+                                theme,
+                                "changes-action-commit",
+                                GIT_ACTION_ICON_COMMIT,
+                                "Commit",
+                                commit_enabled,
+                                self.git_action_in_flight == Some(GitActionKind::Commit),
+                            )
+                            .when(commit_enabled, |this| {
+                                this.on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_commit_action(cx);
+                                }))
+                            }),
+                        )
+                        .child(
+                            git_action_button(
+                                theme,
+                                "changes-action-push",
+                                GIT_ACTION_ICON_PUSH,
+                                "Push",
+                                push_enabled,
+                                self.git_action_in_flight == Some(GitActionKind::Push),
+                            )
+                            .when(push_enabled, |this| {
+                                this.on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_push_action(cx);
+                                }))
+                            }),
+                        )
+                        .child(
+                            git_action_button(
+                                theme,
+                                "changes-action-pr",
+                                GIT_ACTION_ICON_PR,
+                                "Create PR",
+                                pr_enabled,
+                                self.git_action_in_flight == Some(GitActionKind::CreatePullRequest),
+                            )
+                            .when(pr_enabled, |this| {
+                                this.on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_create_pr_action(cx);
+                                }))
+                            }),
+                        ),
+                )
+            })
+            .when(is_pr_mode, |this| {
+                let threads_loading = self.review_threads_loading;
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_xs().text_color(rgb(theme.text_muted)).child(
+                            if self.pr_changed_files_loading {
+                                "Loading PR files...".to_owned()
+                            } else {
+                                format!("{} files", self.pr_changed_files.len())
+                            },
+                        ))
+                        .child(
+                            div()
+                                .id("refresh-review-comments")
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .hover(|s| s.opacity(0.8))
+                                .when(threads_loading, |this| this.opacity(0.4))
+                                .child(
+                                    svg()
+                                        .path("icons/ui/refresh-muted.svg")
+                                        .size(px(14.))
+                                        .text_color(rgb(theme.text_muted)),
+                                )
+                                .when(threads_loading, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme.text_disabled))
+                                            .child("..."),
+                                    )
+                                })
+                                .when(!threads_loading, |this| {
+                                    this.on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh_review_threads_for_worktree(cx);
+                                    }))
+                                }),
+                        ),
+                )
+            });
+
+        let file_list = if is_pr_mode {
+            self.render_pr_changed_files_list(&selected_path, &search_lower, theme, cx)
+        } else {
+            self.render_local_changed_files_list(&selected_path, &search_lower, theme, cx)
+        };
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when(has_pr, |this| this.child(mode_toggle_row))
+            .child(action_header)
+            .child(file_list)
+    }
+
+    fn render_changes_mode_button(
+        &self,
+        label: &'static str,
+        mode: ChangesViewMode,
+        current: ChangesViewMode,
+        theme: ThemePalette,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let is_active = mode == current;
+        div()
+            .id(ElementId::Name(format!("mode-{label}").into()))
+            .cursor_pointer()
+            .px(px(6.))
+            .py(px(2.))
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .rounded_sm()
+            .when(is_active, |this| {
+                this.bg(rgb(theme.panel_active_bg))
+                    .text_color(rgb(theme.text_primary))
+            })
+            .when(!is_active, |this| {
+                this.text_color(rgb(theme.text_muted))
+                    .hover(|this| this.bg(rgb(theme.panel_bg)))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    if this.changes_view_mode != mode {
+                        // Invalidate any open diff session for the active worktree
+                        // so switching modes forces a rebuild with the right diff source.
+                        if let Some(worktree_path) =
+                            this.selected_worktree_path().map(Path::to_path_buf)
+                        {
+                            this.diff_sessions
+                                .retain(|s| s.worktree_path != worktree_path);
+                        }
+                        this.changes_view_mode = mode;
+                        this.selected_changed_file = None;
+                        if mode == ChangesViewMode::PrChanges
+                            && this.pr_changed_files.is_empty()
+                            && !this.pr_changed_files_loading
+                        {
+                            this.refresh_pr_changed_files(cx);
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(label)
+    }
+
+    fn render_local_changed_files_list(
+        &self,
+        selected_path: &Option<PathBuf>,
+        search_lower: &str,
+        theme: ThemePalette,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let filtered_changes: Vec<_> = self
             .changed_files
             .iter()
@@ -11349,186 +12196,187 @@ impl ArborWindow {
                         .path
                         .to_string_lossy()
                         .to_lowercase()
-                        .contains(&search_lower)
+                        .contains(search_lower)
             })
             .cloned()
             .collect();
 
         div()
+            .id("changes-scroll")
             .flex_1()
             .min_h_0()
+            .overflow_y_scroll()
+            .scrollbar_width(px(10.))
             .flex()
             .flex_col()
-            .child(
+            .font_family(FONT_MONO)
+            .p_1()
+            .children(filtered_changes.iter().map(|change| {
+                let is_selected = selected_path
+                    .as_ref()
+                    .is_some_and(|selected| selected.as_path() == change.path.as_path());
+                let status_color = match change.kind {
+                    ChangeKind::Added => 0xa6e3a1,
+                    ChangeKind::Modified => 0xf9e2af,
+                    ChangeKind::Removed => 0xf38ba8,
+                    ChangeKind::Renamed => 0x89dceb,
+                    ChangeKind::Copied => 0x74c7ec,
+                    ChangeKind::TypeChange => 0xcba6f7,
+                    ChangeKind::Conflict => 0xf38ba8,
+                    ChangeKind::IntentToAdd => 0x94e2d5,
+                };
+                let path_color = match change.kind {
+                    ChangeKind::Added => 0x8fd7ad,
+                    ChangeKind::Removed => 0xf2a4b7,
+                    ChangeKind::Modified => 0xd9d7cf,
+                    ChangeKind::Renamed => 0x8ecae6,
+                    ChangeKind::Copied => 0x91d7e3,
+                    ChangeKind::TypeChange => 0xc4b1ee,
+                    ChangeKind::Conflict => 0xf38ba8,
+                    ChangeKind::IntentToAdd => 0x94e2d5,
+                };
+                let display_path =
+                    truncate_middle_path_for_width(change.path.as_path(), self.right_pane_width);
+                let file_path = change.path.clone();
+
                 div()
-                    .h(px(32.))
-                    .px_1()
-                    .gap_1()
+                    .id(ElementId::Name(
+                        format!("changed-file-{}", display_path).into(),
+                    ))
+                    .h(px(24.))
+                    .pl(px(4.))
+                    .pr_1()
+                    .cursor_pointer()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(rgb(theme.border))
+                    .gap_1()
+                    .when(is_selected, |this| this.bg(rgb(theme.panel_active_bg)))
+                    .when(!is_selected, |this| {
+                        this.hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.select_changed_file(file_path.clone(), cx);
+                            this.open_diff_tab_for_selected_file(cx);
+                        }),
+                    )
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                git_action_button(
-                                    theme,
-                                    "changes-action-commit",
-                                    GIT_ACTION_ICON_COMMIT,
-                                    "Commit",
-                                    commit_enabled,
-                                    self.git_action_in_flight == Some(GitActionKind::Commit),
-                                )
-                                .when(commit_enabled, |this| {
-                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                        this.run_commit_action(cx);
-                                    }))
-                                }),
-                            )
-                            .child(
-                                git_action_button(
-                                    theme,
-                                    "changes-action-push",
-                                    GIT_ACTION_ICON_PUSH,
-                                    "Push",
-                                    push_enabled,
-                                    self.git_action_in_flight == Some(GitActionKind::Push),
-                                )
-                                .when(push_enabled, |this| {
-                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                        this.run_push_action(cx);
-                                    }))
-                                }),
-                            )
-                            .child(
-                                git_action_button(
-                                    theme,
-                                    "changes-action-pr",
-                                    GIT_ACTION_ICON_PR,
-                                    "Create PR",
-                                    pr_enabled,
-                                    self.git_action_in_flight
-                                        == Some(GitActionKind::CreatePullRequest),
-                                )
-                                .when(pr_enabled, |this| {
-                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                        this.run_create_pr_action(cx);
-                                    }))
-                                }),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("changes-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .scrollbar_width(px(10.))
-                    .flex()
-                    .flex_col()
-                    .font_family(FONT_MONO)
-                    .p_1()
-                    .children(filtered_changes.iter().map(|change| {
-                        let is_selected = selected_path
-                            .as_ref()
-                            .is_some_and(|selected| selected.as_path() == change.path.as_path());
-                        let status_color = match change.kind {
-                            ChangeKind::Added => 0xa6e3a1,
-                            ChangeKind::Modified => 0xf9e2af,
-                            ChangeKind::Removed => 0xf38ba8,
-                            ChangeKind::Renamed => 0x89dceb,
-                            ChangeKind::Copied => 0x74c7ec,
-                            ChangeKind::TypeChange => 0xcba6f7,
-                            ChangeKind::Conflict => 0xf38ba8,
-                            ChangeKind::IntentToAdd => 0x94e2d5,
-                        };
-                        let path_color = match change.kind {
-                            ChangeKind::Added => 0x8fd7ad,
-                            ChangeKind::Removed => 0xf2a4b7,
-                            ChangeKind::Modified => 0xd9d7cf,
-                            ChangeKind::Renamed => 0x8ecae6,
-                            ChangeKind::Copied => 0x91d7e3,
-                            ChangeKind::TypeChange => 0xc4b1ee,
-                            ChangeKind::Conflict => 0xf38ba8,
-                            ChangeKind::IntentToAdd => 0x94e2d5,
-                        };
-                        let display_path = truncate_middle_path_for_width(
-                            change.path.as_path(),
-                            self.right_pane_width,
-                        );
-                        let file_path = change.path.clone();
-
+                            .flex_none()
+                            .text_size(px(10.))
+                            .text_color(rgb(status_color))
+                            .child(change_code(change.kind)),
+                    )
+                    .child(
                         div()
-                            .id(ElementId::Name(
-                                format!("changed-file-{}", display_path).into(),
-                            ))
-                            .h(px(24.))
-                            .pl(px(4.))
-                            .pr_1()
-                            .cursor_pointer()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(rgb(path_color))
+                            .child(display_path),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
                             .flex()
                             .items_center()
+                            .justify_end()
                             .gap_1()
-                            .when(is_selected, |this| this.bg(rgb(theme.panel_active_bg)))
-                            .when(!is_selected, |this| {
-                                this.hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                            .when(change.additions > 0, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x72d69c))
+                                        .child(format!("+{}", change.additions)),
+                                )
                             })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                    this.select_changed_file(file_path.clone(), cx);
-                                    this.open_diff_tab_for_selected_file(cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(status_color))
-                                    .child(change_code(change.kind)),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .text_color(rgb(path_color))
-                                    .child(display_path),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .gap_1()
-                                    .when(change.additions > 0, |this| {
-                                        this.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(0x72d69c))
-                                                .child(format!("+{}", change.additions)),
-                                        )
-                                    })
-                                    .when(change.deletions > 0, |this| {
-                                        this.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(0xeb6f92))
-                                                .child(format!("-{}", change.deletions)),
-                                        )
-                                    }),
-                            )
-                    })),
-            )
+                            .when(change.deletions > 0, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0xeb6f92))
+                                        .child(format!("-{}", change.deletions)),
+                                )
+                            }),
+                    )
+            }))
+    }
+
+    fn render_pr_changed_files_list(
+        &self,
+        selected_path: &Option<PathBuf>,
+        search_lower: &str,
+        theme: ThemePalette,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let filtered_files: Vec<_> = self
+            .pr_changed_files
+            .iter()
+            .filter(|file| {
+                search_lower.is_empty()
+                    || file
+                        .path
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(search_lower)
+            })
+            .cloned()
+            .collect();
+
+        div()
+            .id("changes-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .scrollbar_width(px(10.))
+            .flex()
+            .flex_col()
+            .font_family(FONT_MONO)
+            .p_1()
+            .children(filtered_files.iter().map(|file| {
+                let is_selected = selected_path
+                    .as_ref()
+                    .is_some_and(|selected| selected.as_path() == file.path.as_path());
+                let display_path =
+                    truncate_middle_path_for_width(file.path.as_path(), self.right_pane_width);
+                let file_path = file.path.clone();
+
+                div()
+                    .id(ElementId::Name(format!("pr-file-{}", display_path).into()))
+                    .h(px(24.))
+                    .pl(px(4.))
+                    .pr_1()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(is_selected, |this| this.bg(rgb(theme.panel_active_bg)))
+                    .when(!is_selected, |this| {
+                        this.hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.selected_changed_file = Some(file_path.clone());
+                            this.open_pr_diff_tab_for_selected_file(cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child(display_path),
+                    )
+            }))
     }
 
     fn render_file_tree(&self, cx: &mut Context<Self>) -> Div {
@@ -16071,6 +16919,7 @@ mod tests {
             title: "Improve hover stability".to_owned(),
             url: "https://example.com/pr/42".to_owned(),
             state: crate::github_service::PrState::Open,
+            base_ref_name: "main".to_owned(),
             additions: 12,
             deletions: 4,
             review_decision: crate::github_service::ReviewDecision::Pending,
