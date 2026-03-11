@@ -1,4 +1,4 @@
-name: CodSpeed Benchmarks
+name: CodSpeed
 
 on:
   push:
@@ -33,7 +33,7 @@ jobs:
           online-audits: false
 
   codspeed:
-    name: Run Benchmarks
+    name: Benchmarks
     needs: zizmor
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
@@ -51,11 +51,6 @@ jobs:
           rustup toolchain install ${{ env.NIGHTLY_TOOLCHAIN }} --profile minimal
           rustup default ${{ env.NIGHTLY_TOOLCHAIN }}
 
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          shared-key: codspeed-v1
-          cache-all-crates: true
-
       - name: Install Zig
         run: |
           ZIG_VERSION=0.15.2
@@ -64,18 +59,27 @@ jobs:
           echo "${PWD}/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
       - name: Install cargo-codspeed
-        uses: taiki-e/install-action@f176c07a0a40cbfdd08ee9aa8bf1655701d11e69 # v2.67.25
+        uses: taiki-e/install-action@a7c938ee233ac44ef6f2fba5ac2d30fa12584c6e # cargo-codspeed
         with:
-          tool: cargo-codspeed@4.3.0
+          tool: cargo-codspeed
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libavahi-client-dev
 
       - name: Build Ghostty VT bridge
         run: ./scripts/build-ghostty-vt-bridge.sh
 
-      - name: Build benchmarks
-        run: cargo codspeed build -p arbor-benchmarks --features ghostty-vt-experimental --bench embedded_terminal
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build -p arbor-benchmarks --features ghostty-vt-experimental --bench embedded_terminal -m simulation
 
-      - name: Run benchmarks
-        uses: CodSpeedHQ/action@4deb3275dd364fb96fb074c953133d29ec96f80f # v4
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@281164b0f014a4e7badd2c02cecad9b595b70537 # v4.11.1
         with:
           mode: simulation
-          run: cargo codspeed run -p arbor-benchmarks --features ghostty-vt-experimental --bench embedded_terminal
+          run: cargo codspeed run -p arbor-benchmarks --bench embedded_terminal
