@@ -5893,9 +5893,18 @@ fn load_task_templates_for_repo(repo_root: &Path) -> Vec<TaskTemplate> {
 
 fn parse_task_template(path: &Path, repo_root: &Path) -> Option<TaskTemplate> {
     let content = fs::read_to_string(path).ok()?;
+    parse_task_template_content(path, repo_root, &content)
+}
+
+fn parse_task_template_content(
+    path: &Path,
+    repo_root: &Path,
+    content: &str,
+) -> Option<TaskTemplate> {
     let mut name = path.file_stem()?.to_string_lossy().into_owned();
+    let mut description = None;
     let mut agent = None;
-    let mut body = content.as_str();
+    let mut body = content;
 
     if content
         .lines()
@@ -5923,10 +5932,12 @@ fn parse_task_template(path: &Path, repo_root: &Path) -> Option<TaskTemplate> {
                 let Some((key, value)) = line.split_once(':') else {
                     continue;
                 };
-                let key = key.trim();
+                let key = key.trim().to_ascii_lowercase();
                 let value = value.trim().trim_matches('"').trim_matches('\'');
-                match key {
+                match key.as_str() {
                     "name" if !value.is_empty() => name = value.to_owned(),
+                    "title" if !value.is_empty() => name = value.to_owned(),
+                    "description" if !value.is_empty() => description = Some(value.to_owned()),
                     "agent" => agent = AgentPresetKind::from_key(value),
                     _ => {},
                 }
@@ -5934,16 +5945,70 @@ fn parse_task_template(path: &Path, repo_root: &Path) -> Option<TaskTemplate> {
         }
     }
 
-    let prompt = body.trim().to_owned();
+    let mut prompt_lines = Vec::new();
+    let mut found_prompt_line = false;
+    let mut heading_name = None;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if !found_prompt_line {
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if heading_name.is_none()
+                && let Some(heading) = trimmed.strip_prefix("# ")
+            {
+                let heading = heading.trim();
+                if !heading.is_empty() {
+                    heading_name = Some(heading.to_owned());
+                }
+                continue;
+            }
+
+            if let Some((raw_key, raw_value)) = trimmed.split_once(':') {
+                let key = raw_key.trim().to_ascii_lowercase();
+                let value = raw_value.trim().trim_matches('"').trim_matches('\'');
+                match key.as_str() {
+                    "agent" => {
+                        if agent.is_none() {
+                            agent = AgentPresetKind::from_key(value);
+                        }
+                        continue;
+                    },
+                    "description" => {
+                        if description.is_none() && !value.is_empty() {
+                            description = Some(value.to_owned());
+                        }
+                        continue;
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        found_prompt_line = true;
+        prompt_lines.push(line);
+    }
+
+    if let Some(heading_name) = heading_name
+        && name == path.file_stem()?.to_string_lossy()
+    {
+        name = heading_name;
+    }
+
+    let prompt = prompt_lines.join("\n").trim().to_owned();
     if prompt.is_empty() {
         return None;
     }
-    let description = prompt
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or("Task template")
-        .to_owned();
+    let description = description.unwrap_or_else(|| {
+        prompt
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .unwrap_or("Task template")
+            .to_owned()
+    });
 
     Some(TaskTemplate {
         name,
@@ -6043,7 +6108,7 @@ mod tests {
             daemon,
         },
         gpui::{Keystroke, point, px},
-        std::{sync::Arc, time::Instant},
+        std::{path::Path, sync::Arc, time::Instant},
     };
 
     fn session_with_styled_line(
@@ -6341,7 +6406,7 @@ mod tests {
         session.modes = TerminalModes::default();
 
         let changed = apply_daemon_snapshot(&mut session, &daemon::TerminalSnapshot {
-            session_id: "daemon-test-1".to_owned(),
+            session_id: "daemon-test-1".to_owned().into(),
             output_tail: "READY".to_owned(),
             styled_lines: vec![daemon::DaemonTerminalStyledLine {
                 cells: vec![daemon::DaemonTerminalStyledCell {
@@ -6953,5 +7018,51 @@ mod tests {
     #[test]
     fn seed_repo_root_from_cwd_when_store_has_saved_roots() {
         assert!(crate::should_seed_repo_root_from_cwd(true, false));
+    }
+
+    #[test]
+    fn parse_task_template_supports_frontmatter_description_and_agent() {
+        let repo_root = Path::new("/tmp/repo");
+        let path = repo_root.join(".arbor/tasks/review.md");
+        let content = r#"---
+name: Review PR
+description: Review the riskiest changes first
+agent: codex
+---
+Review the current branch and summarize the highest-risk changes.
+"#;
+
+        let task = crate::parse_task_template_content(&path, repo_root, content)
+            .unwrap_or_else(|| panic!("task template should parse"));
+        assert_eq!(task.name, "Review PR");
+        assert_eq!(task.description, "Review the riskiest changes first");
+        assert_eq!(task.agent, Some(crate::AgentPresetKind::Codex));
+        assert_eq!(
+            task.prompt,
+            "Review the current branch and summarize the highest-risk changes."
+        );
+    }
+
+    #[test]
+    fn parse_task_template_supports_heading_and_agent_metadata() {
+        let repo_root = Path::new("/tmp/repo");
+        let path = repo_root.join(".arbor/tasks/review.md");
+        let content = r#"# Review PR
+
+Agent: Codex
+Description: Review the current branch before merge
+
+Review the current branch and summarize the highest-risk changes.
+"#;
+
+        let task = crate::parse_task_template_content(&path, repo_root, content)
+            .unwrap_or_else(|| panic!("task template should parse"));
+        assert_eq!(task.name, "Review PR");
+        assert_eq!(task.description, "Review the current branch before merge");
+        assert_eq!(task.agent, Some(crate::AgentPresetKind::Codex));
+        assert_eq!(
+            task.prompt,
+            "Review the current branch and summarize the highest-risk changes."
+        );
     }
 }

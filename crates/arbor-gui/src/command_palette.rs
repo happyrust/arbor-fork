@@ -123,25 +123,28 @@ impl ArborWindow {
         };
 
         let query = modal.query.trim().to_ascii_lowercase();
-        let mut items = self.command_palette_items();
         if query.is_empty() {
-            return items;
+            return self.command_palette_items();
         }
 
-        items.retain(|item| {
-            item.search_text.contains(&query) || item.title.to_ascii_lowercase().contains(&query)
+        let mut matches = self
+            .command_palette_items()
+            .into_iter()
+            .filter_map(|item| {
+                command_palette_match_score(&item, &query).map(|score| (score, item))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|(left_score, left_item), (right_score, right_item)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| {
+                    left_item
+                        .title
+                        .to_ascii_lowercase()
+                        .cmp(&right_item.title.to_ascii_lowercase())
+                })
         });
-        items.sort_by_key(|item| {
-            let title = item.title.to_ascii_lowercase();
-            if title.starts_with(&query) {
-                0
-            } else if title.contains(&query) {
-                1
-            } else {
-                2
-            }
-        });
-        items
+        matches.into_iter().map(|(_, item)| item).collect()
     }
 
     fn move_command_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -583,4 +586,166 @@ fn command_palette_scrollbar_indicator(
                     .bg(rgb(theme.accent)),
             ),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CommandPaletteMatchScore {
+    bucket: u8,
+    title_position: usize,
+    search_position: usize,
+    title_len: usize,
+}
+
+fn command_palette_match_score(
+    item: &CommandPaletteItem,
+    query: &str,
+) -> Option<CommandPaletteMatchScore> {
+    let title = item.title.to_ascii_lowercase();
+    let subtitle = item.subtitle.to_ascii_lowercase();
+    let search_text = item.search_text.to_ascii_lowercase();
+    let tokens = command_palette_query_tokens(query);
+    if tokens.is_empty() {
+        return Some(CommandPaletteMatchScore {
+            bucket: 0,
+            title_position: 0,
+            search_position: 0,
+            title_len: title.len(),
+        });
+    }
+
+    let exact_title = title == query;
+    let title_starts = title.starts_with(query);
+    let acronym_match = command_palette_initialism(&title) == query;
+    let word_prefix_match = command_palette_title_word_prefix_match(&title, &tokens);
+    let title_position = title.find(query).unwrap_or(usize::MAX);
+    let search_position = search_text.find(query).unwrap_or(usize::MAX);
+    let token_match = command_palette_tokens_match(&tokens, &[&title, &subtitle, &search_text]);
+
+    let bucket = if exact_title {
+        0
+    } else if title_starts {
+        1
+    } else if acronym_match {
+        2
+    } else if word_prefix_match {
+        3
+    } else if title_position != usize::MAX {
+        4
+    } else if token_match {
+        5
+    } else if search_position != usize::MAX {
+        6
+    } else {
+        return None;
+    };
+
+    Some(CommandPaletteMatchScore {
+        bucket,
+        title_position,
+        search_position,
+        title_len: title.len(),
+    })
+}
+
+fn command_palette_query_tokens(query: &str) -> Vec<&str> {
+    query
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn command_palette_title_word_prefix_match(title: &str, tokens: &[&str]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+
+    let words = title
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return false;
+    }
+
+    let mut word_index = 0usize;
+    for token in tokens {
+        let mut matched = false;
+        while let Some(word) = words.get(word_index) {
+            word_index += 1;
+            if word.starts_with(token) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn command_palette_tokens_match(tokens: &[&str], fields: &[&str]) -> bool {
+    tokens.iter().all(|token| fields.iter().any(|field| field.contains(token)))
+}
+
+fn command_palette_initialism(title: &str) -> String {
+    title
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .filter_map(|word| word.chars().next())
+        .collect()
+}
+
+#[cfg(test)]
+mod command_palette_tests {
+    use super::*;
+
+    fn palette_item(title: &str, subtitle: &str, search_text: &str) -> CommandPaletteItem {
+        CommandPaletteItem {
+            title: title.to_owned(),
+            subtitle: subtitle.to_owned(),
+            search_text: search_text.to_owned(),
+            action: CommandPaletteAction::RefreshWorktrees,
+        }
+    }
+
+    #[test]
+    fn command_palette_scores_exact_matches_first() {
+        let exact = command_palette_match_score(
+            &palette_item("Open Settings", "Settings", "open settings config"),
+            "open settings",
+        )
+        .unwrap_or_else(|| panic!("exact match should score"));
+        let fuzzy = command_palette_match_score(
+            &palette_item("Settings", "Preferences", "open settings config"),
+            "open settings",
+        )
+        .unwrap_or_else(|| panic!("token match should score"));
+
+        assert!(exact < fuzzy);
+    }
+
+    #[test]
+    fn command_palette_supports_initialism_matching() {
+        let score = command_palette_match_score(
+            &palette_item("New Worktree", "Create a local worktree", "new worktree create"),
+            "nw",
+        );
+        assert!(score.is_some());
+    }
+
+    #[test]
+    fn command_palette_supports_multi_token_word_prefix_matching() {
+        let score = command_palette_match_score(
+            &palette_item(
+                "Refresh Worktrees",
+                "Reload repositories and worktrees",
+                "refresh worktrees reload repos",
+            ),
+            "ref work",
+        );
+        assert!(score.is_some());
+    }
 }

@@ -994,20 +994,25 @@ pub(crate) fn spawn_notification_webhooks(
         return;
     }
 
-    let payload_text = match serde_json::to_string(&payload) {
-        Ok(payload_text) => payload_text,
-        Err(error) => {
-            tracing::warn!(%error, event = event_name, "failed to serialize webhook payload");
-            return;
-        },
-    };
-
     tokio::spawn(async move {
         let _ = tokio::task::spawn_blocking(move || {
             for url in urls {
+                let body = match notification_webhook_request_body(&url, event_name, &payload) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            %url,
+                            event = event_name,
+                            "failed to serialize notification webhook request"
+                        );
+                        continue;
+                    },
+                };
+
                 let response = ureq::post(&url)
                     .header("content-type", "application/json")
-                    .send(&payload_text);
+                    .send(&body);
                 if let Err(error) = response {
                     tracing::warn!(%error, %url, event = event_name, "notification webhook failed");
                 }
@@ -1015,6 +1020,95 @@ pub(crate) fn spawn_notification_webhooks(
         })
         .await;
     });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationWebhookFormat {
+    GenericJson,
+    SlackIncomingWebhook,
+    DiscordWebhook,
+}
+
+fn notification_webhook_format(url: &str) -> NotificationWebhookFormat {
+    let url = url.to_ascii_lowercase();
+    if url.contains("hooks.slack.com/") {
+        NotificationWebhookFormat::SlackIncomingWebhook
+    } else if url.contains("discord.com/api/webhooks/")
+        || url.contains("discordapp.com/api/webhooks/")
+    {
+        NotificationWebhookFormat::DiscordWebhook
+    } else {
+        NotificationWebhookFormat::GenericJson
+    }
+}
+
+fn notification_webhook_request_body(
+    url: &str,
+    event_name: &str,
+    payload: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    match notification_webhook_format(url) {
+        NotificationWebhookFormat::GenericJson => serde_json::to_string(payload),
+        NotificationWebhookFormat::SlackIncomingWebhook => serde_json::to_string(
+            &serde_json::json!({ "text": notification_webhook_text(event_name, payload) }),
+        ),
+        NotificationWebhookFormat::DiscordWebhook => serde_json::to_string(
+            &serde_json::json!({ "content": notification_webhook_text(event_name, payload) }),
+        ),
+    }
+}
+
+fn notification_webhook_text(event_name: &str, payload: &serde_json::Value) -> String {
+    let repo_root = notification_payload_field(payload, "repo_root");
+    let worktree_path = notification_payload_field(payload, "worktree_path");
+    let branch = notification_payload_field(payload, "branch");
+    let cwd = notification_payload_field(payload, "cwd");
+    let process_name = notification_payload_field(payload, "process_name");
+    let command = notification_payload_field(payload, "command");
+    let exit_code = payload.get("exit_code").and_then(serde_json::Value::as_i64);
+
+    match event_name {
+        "agent_finished" => {
+            let mut parts = vec!["Arbor agent finished".to_owned()];
+            if let Some(branch) = branch {
+                parts.push(format!("branch `{branch}`"));
+            }
+            if let Some(worktree_path) = worktree_path.or(cwd) {
+                parts.push(format!("worktree `{worktree_path}`"));
+            }
+            if let Some(repo_root) = repo_root {
+                parts.push(format!("repo `{repo_root}`"));
+            }
+            parts.join(" · ")
+        },
+        "agent_error" => {
+            let mut parts = vec!["Arbor process error".to_owned()];
+            if let Some(process_name) = process_name {
+                parts.push(format!("process `{process_name}`"));
+            }
+            if let Some(command) = command {
+                parts.push(format!("command `{command}`"));
+            }
+            if let Some(exit_code) = exit_code {
+                parts.push(format!("exit {exit_code}"));
+            }
+            if let Some(repo_root) = repo_root {
+                parts.push(format!("repo `{repo_root}`"));
+            }
+            parts.join(" · ")
+        },
+        _ => {
+            let mut parts = vec![format!("Arbor event `{event_name}`")];
+            if let Some(repo_root) = repo_root {
+                parts.push(format!("repo `{repo_root}`"));
+            }
+            parts.join(" · ")
+        },
+    }
+}
+
+fn notification_payload_field<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    payload.get(key).and_then(serde_json::Value::as_str)
 }
 
 fn agent_session_snapshot(sessions: &mut HashMap<String, AgentSession>) -> Vec<AgentSessionDto> {
@@ -1664,4 +1758,76 @@ async fn lookup_pr_cached(
     }
 
     (pr_number, pr_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_webhook_format_detects_provider_specific_urls() {
+        assert_eq!(
+            notification_webhook_format("https://hooks.slack.com/services/T000/B000/abc"),
+            NotificationWebhookFormat::SlackIncomingWebhook
+        );
+        assert_eq!(
+            notification_webhook_format("https://discord.com/api/webhooks/123/abc"),
+            NotificationWebhookFormat::DiscordWebhook
+        );
+        assert_eq!(
+            notification_webhook_format("https://example.com/hooks/arbor"),
+            NotificationWebhookFormat::GenericJson
+        );
+    }
+
+    #[test]
+    fn notification_webhook_request_body_uses_slack_text_payload() {
+        let payload = serde_json::json!({
+            "event": "agent_finished",
+            "repo_root": "/tmp/repo",
+            "worktree_path": "/tmp/repo-feature",
+            "branch": "feature/test"
+        });
+        let body = notification_webhook_request_body(
+            "https://hooks.slack.com/services/T000/B000/abc",
+            "agent_finished",
+            &payload,
+        )
+        .unwrap_or_else(|error| panic!("request body should serialize: {error}"));
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("request body should parse: {error}"));
+
+        assert_eq!(
+            json.get("text").and_then(serde_json::Value::as_str),
+            Some(
+                "Arbor agent finished · branch `feature/test` · worktree `/tmp/repo-feature` · repo `/tmp/repo`"
+            )
+        );
+    }
+
+    #[test]
+    fn notification_webhook_request_body_uses_discord_content_payload() {
+        let payload = serde_json::json!({
+            "event": "agent_error",
+            "repo_root": "/tmp/repo",
+            "process_name": "web",
+            "command": "npm test",
+            "exit_code": 1
+        });
+        let body = notification_webhook_request_body(
+            "https://discord.com/api/webhooks/123/abc",
+            "agent_error",
+            &payload,
+        )
+        .unwrap_or_else(|error| panic!("request body should serialize: {error}"));
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("request body should parse: {error}"));
+
+        assert_eq!(
+            json.get("content").and_then(serde_json::Value::as_str),
+            Some(
+                "Arbor process error · process `web` · command `npm test` · exit 1 · repo `/tmp/repo`"
+            )
+        );
+    }
 }
