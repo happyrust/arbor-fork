@@ -48,6 +48,21 @@ pub(crate) fn is_command_in_path(command: &str) -> bool {
     env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
 }
 
+/// Returns `true` when the platform is expected to support native file-picker
+/// dialogs. On macOS/Windows this is always true. On Linux it checks whether
+/// `xdg-desktop-portal` is installed (required by the ashpd-based file picker
+/// in GPUI for both X11 and Wayland).
+pub(crate) fn has_native_file_picker() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        is_command_in_path("xdg-desktop-portal")
+    }
+}
+
 /// Return the set of `AgentPresetKind` variants whose CLI is found in PATH.
 /// Cached for the lifetime of the process (the set of installed tools is
 /// unlikely to change while the app is running).
@@ -914,8 +929,11 @@ pub(crate) fn try_auto_start_daemon(
     let binary = find_arbor_httpd_binary()?;
     tracing::info!(path = %binary.display(), "auto-starting arbor-httpd");
 
-    let home = env::var("HOME").ok().map(PathBuf::from)?;
-    let log_dir = home.join(".arbor/daemon");
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .ok()
+        .map(PathBuf::from)?;
+    let log_dir = home.join(".arbor").join("daemon");
     if let Err(error) = fs::create_dir_all(&log_dir) {
         tracing::warn!(%error, "failed to create daemon log directory");
     }
@@ -988,8 +1006,14 @@ pub(crate) fn try_auto_start_daemon(
 /// Search for the `arbor-httpd` binary next to the current executable,
 /// then fall back to `PATH` lookup.
 pub(crate) fn find_arbor_httpd_binary() -> Option<PathBuf> {
+    let binary_name = if cfg!(windows) {
+        "arbor-httpd.exe"
+    } else {
+        "arbor-httpd"
+    };
+
     if let Ok(exe) = env::current_exe() {
-        let sibling = exe.with_file_name("arbor-httpd");
+        let sibling = exe.with_file_name(binary_name);
         if sibling.is_file() {
             return Some(sibling);
         }
@@ -997,7 +1021,7 @@ pub(crate) fn find_arbor_httpd_binary() -> Option<PathBuf> {
 
     env::var_os("PATH").and_then(|paths| {
         env::split_paths(&paths)
-            .map(|dir| dir.join("arbor-httpd"))
+            .map(|dir| dir.join(binary_name))
             .find(|candidate| candidate.is_file())
     })
 }
@@ -1192,6 +1216,12 @@ impl EntityInputHandler for ArborWindow {
         if self.welcome_clone_url_active {
             self.welcome_clone_url.push_str(text);
             self.welcome_clone_error = None;
+            cx.notify();
+            return;
+        }
+        if self.welcome_local_path_active {
+            self.welcome_local_path.push_str(text);
+            self.welcome_local_path_error = None;
             cx.notify();
             return;
         }

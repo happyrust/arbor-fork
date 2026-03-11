@@ -309,14 +309,15 @@ impl LiveSession {
 
         let (styled_lines, cursor, modes) = {
             let emulator = lock_or_recover(&self.emulator);
-            let mut styled_lines = emulator.collect_styled_lines();
+            let snapshot = emulator.snapshot();
+            let mut styled_lines = snapshot.styled_lines;
             let keep_from = if max_lines == 0 {
                 0
             } else {
                 styled_lines.len().saturating_sub(max_lines)
             };
 
-            let cursor = emulator.snapshot_cursor().and_then(|cursor| {
+            let cursor = snapshot.cursor.and_then(|cursor| {
                 (cursor.line >= keep_from).then_some(DaemonTerminalCursor {
                     line: cursor.line - keep_from,
                     column: cursor.column,
@@ -327,14 +328,13 @@ impl LiveSession {
                 styled_lines.drain(..keep_from);
             }
 
-            let modes = emulator.snapshot_modes();
             (
                 styled_lines
                     .into_iter()
                     .map(convert_styled_line)
                     .collect::<Vec<_>>(),
                 cursor,
-                convert_terminal_modes(modes),
+                convert_terminal_modes(snapshot.modes),
             )
         };
 
@@ -487,6 +487,29 @@ impl LocalTerminalDaemon {
         let next = self.next_session_id;
         self.next_session_id = self.next_session_id.saturating_add(1);
         SessionId::new(format!("{DAEMON_SESSION_PREFIX}{next}"))
+    }
+
+    /// Remove sessions that have exited (completed or failed) and have no
+    /// active broadcast receivers.  This prevents dead sessions from
+    /// accumulating memory indefinitely (each holds ~23 MB of scrollback).
+    pub fn reap_exited_sessions(&mut self) {
+        let before = self.sessions.len();
+        self.sessions.retain(|_, session| {
+            let state = *lock_or_recover(&session.state);
+            !matches!(
+                state,
+                TerminalSessionState::Completed | TerminalSessionState::Failed
+            )
+        });
+        let reaped = before.saturating_sub(self.sessions.len());
+        if reaped > 0 {
+            tracing::info!(
+                reaped,
+                remaining = self.sessions.len(),
+                "reaped exited terminal sessions"
+            );
+            let _ = self.persist_current_sessions();
+        }
     }
 
     /// Render the emulator's current screen to ANSI escape sequences.
