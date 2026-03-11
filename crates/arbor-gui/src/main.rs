@@ -2429,6 +2429,12 @@ impl ArborWindow {
         let review_service = self.review_service.clone();
 
         cx.spawn(async move |this, cx| {
+            // Keep copies for optimistic injection after the API call
+            let inject_file_path = file_path.clone();
+            let inject_worktree_path = worktree_path.clone();
+            let inject_line = line;
+            let inject_side = side;
+
             let result = cx
                 .background_spawn(async move {
                     review_service.post_review_comment(
@@ -2445,8 +2451,29 @@ impl ArborWindow {
 
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok(posted_comment) => {
                         this.pending_comment = None;
+
+                        // Optimistically inject the new comment into local
+                        // review threads so it appears immediately without
+                        // waiting for a GraphQL round-trip.
+                        let thread = github_service::ReviewThread {
+                            id: format!("local-{}", posted_comment.id),
+                            path: inject_file_path,
+                            line: Some(inject_line),
+                            start_line: None,
+                            side: inject_side,
+                            is_resolved: false,
+                            is_outdated: false,
+                            comments: vec![posted_comment],
+                        };
+                        this.review_threads
+                            .entry(inject_worktree_path.clone())
+                            .or_default()
+                            .push(thread);
+                        this.rebuild_diff_sessions_for_worktree(&inject_worktree_path, cx);
+
+                        // Also refresh from the server to reconcile
                         this.refresh_review_threads_for_worktree(cx);
                     },
                     Err(error) => {
