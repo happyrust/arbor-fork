@@ -50,6 +50,9 @@ check-ghostty-vt-httpd: ghostty-vt-bridge
 bench-embedded-terminal-engines: ghostty-vt-bridge
     RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}" cargo +{{nightly_toolchain}} test -p arbor-terminal-emulator --features ghostty-vt-experimental --test engine_performance -- --ignored --nocapture
 
+bench-embedded-terminal-codspeed: ghostty-vt-bridge
+    RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}" cargo +{{nightly_toolchain}} bench -p arbor-benchmarks --bench embedded_terminal
+
 zizmor:
     zizmor .github/workflows/
 
