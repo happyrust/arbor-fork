@@ -8,6 +8,7 @@ pub mod outpost_store;
 pub mod process;
 pub mod remote;
 pub mod session;
+pub mod task;
 pub mod worktree;
 
 pub use {
