@@ -152,8 +152,8 @@ impl ProcessManager {
         let session_id = format!("process-{}", name);
 
         let result = daemon.create_or_attach(CreateOrAttachRequest {
-            session_id: session_id.clone(),
-            workspace_id: cwd.display().to_string(),
+            session_id: session_id.clone().into(),
+            workspace_id: cwd.display().to_string().into(),
             cwd,
             shell: default_shell(),
             cols: 120,
@@ -165,7 +165,7 @@ impl ProcessManager {
         match result {
             Ok(response) => {
                 process.status = ProcessStatus::Running;
-                process.session_id = Some(response.session.session_id.clone());
+                process.session_id = Some(response.session.session_id.to_string());
                 process.exit_code = None;
                 process.last_start = Some(Instant::now());
                 let info = process.info();
@@ -197,7 +197,7 @@ impl ProcessManager {
 
         if let Some(ref session_id) = process.session_id {
             let _ = daemon.kill(KillRequest {
-                session_id: session_id.clone(),
+                session_id: session_id.clone().into(),
             });
         }
 
@@ -272,6 +272,13 @@ impl ProcessManager {
         D: TerminalDaemon,
         D::Error: ToString,
     {
+        // Load sessions once instead of per-process to avoid O(N) disk reads
+        // and repeated cloning of output_tail buffers.
+        let sessions = match daemon.list_sessions() {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
         let mut restart_schedule: Vec<(String, Duration)> = Vec::new();
 
         let names: Vec<String> = self.processes.keys().cloned().collect();
@@ -289,13 +296,9 @@ impl ProcessManager {
                 continue;
             };
 
-            // Check session state from daemon
-            let sessions = match daemon.list_sessions() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            let session = sessions.iter().find(|s| s.session_id == *session_id);
+            let session = sessions
+                .iter()
+                .find(|s| s.session_id.as_str() == session_id);
 
             let is_exited = match session {
                 Some(s) => matches!(

@@ -12,6 +12,7 @@ mod terminal_backend;
 mod terminal_daemon_http;
 mod terminal_keys;
 mod theme;
+mod types;
 mod ui_state_store;
 
 use {
@@ -860,7 +861,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
             // Ctrl-C: send as signal for reliable delivery
             self.daemon
                 .signal(SignalRequest {
-                    session_id: session.daemon_session_id.clone(),
+                    session_id: session.daemon_session_id.clone().into(),
                     signal: TerminalSignal::Interrupt,
                 })
                 .map_err(|error| error.to_string())
@@ -873,7 +874,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
             tracing::trace!("write_input: WS unavailable, falling back to HTTP POST");
             self.daemon
                 .write(WriteRequest {
-                    session_id: session.daemon_session_id.clone(),
+                    session_id: session.daemon_session_id.clone().into(),
                     bytes: input.to_vec(),
                 })
                 .map_err(|error| error.to_string())
@@ -894,7 +895,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
             && (cols != session.cols || rows != session.rows)
         {
             match self.daemon.resize(ResizeRequest {
-                session_id: session.daemon_session_id.clone(),
+                session_id: session.daemon_session_id.clone().into(),
                 cols,
                 rows,
             }) {
@@ -910,7 +911,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
         }
 
         match self.daemon.snapshot(SnapshotRequest {
-            session_id: session.daemon_session_id.clone(),
+            session_id: session.daemon_session_id.clone().into(),
             max_lines: 220,
         }) {
             Ok(Some(snapshot)) => {
@@ -987,11 +988,11 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
 
         let result = if session.state == TerminalState::Running {
             self.daemon.kill(KillRequest {
-                session_id: session.daemon_session_id.clone(),
+                session_id: session.daemon_session_id.clone().into(),
             })
         } else {
             self.daemon.detach(DetachRequest {
-                session_id: session.daemon_session_id.clone(),
+                session_id: session.daemon_session_id.clone().into(),
             })
         };
 
@@ -2827,8 +2828,8 @@ impl ArborWindow {
             .terminals
             .iter()
             .map(|session| DaemonSessionRecord {
-                session_id: session.daemon_session_id.clone(),
-                workspace_id: session.worktree_path.display().to_string(),
+                session_id: session.daemon_session_id.clone().into(),
+                workspace_id: session.worktree_path.display().to_string().into(),
                 cwd: session.worktree_path.clone(),
                 shell: if session.command.trim().is_empty() {
                     shell.clone()
@@ -2877,13 +2878,13 @@ impl ArborWindow {
                 .updated_at_unix_ms
                 .unwrap_or(0)
                 .cmp(&left.updated_at_unix_ms.unwrap_or(0))
-                .then_with(|| left.session_id.cmp(&right.session_id))
+                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
         });
 
         let mut changed = false;
 
         for record in records {
-            if record.session_id.trim().is_empty() {
+            if record.session_id.as_str().trim().is_empty() {
                 continue;
             }
 
@@ -2904,7 +2905,7 @@ impl ArborWindow {
             if let Some(session) = self
                 .terminals
                 .iter_mut()
-                .find(|session| session.daemon_session_id == record.session_id)
+                .find(|session| session.daemon_session_id == record.session_id.as_str())
             {
                 if session.worktree_path != worktree_path {
                     session.worktree_path = worktree_path.clone();
@@ -2955,7 +2956,7 @@ impl ArborWindow {
                 self.next_terminal_id += 1;
                 self.terminals.push(TerminalSession {
                     id: session_id,
-                    daemon_session_id: record.session_id.clone(),
+                    daemon_session_id: record.session_id.to_string(),
                     worktree_path: worktree_path.clone(),
                     title,
                     last_command: record.last_command.clone(),
@@ -2977,7 +2978,7 @@ impl ArborWindow {
                             self.terminal_daemon.as_ref().map(|daemon| {
                                 local_daemon_runtime(
                                     daemon.clone(),
-                                    record.session_id.clone(),
+                                    record.session_id.to_string(),
                                     Some(self.terminal_poll_tx.clone()),
                                 )
                             })
@@ -2990,7 +2991,7 @@ impl ArborWindow {
             let mapped_terminal_id = self
                 .terminals
                 .iter()
-                .find(|session| session.daemon_session_id == record.session_id)
+                .find(|session| session.daemon_session_id == record.session_id.as_str())
                 .map(|session| session.id);
             if let Some(mapped_terminal_id) = mapped_terminal_id {
                 self.active_terminal_by_worktree
@@ -3007,7 +3008,7 @@ impl ArborWindow {
             return Some(path);
         }
 
-        let workspace_path = PathBuf::from(record.workspace_id.clone());
+        let workspace_path = PathBuf::from(record.workspace_id.to_string());
         self.match_worktree_path(workspace_path.as_path())
     }
 
@@ -4826,6 +4827,8 @@ impl ArborWindow {
                             access_token: Some(token.access_token),
                             token_type: token.token_type,
                             scope: token.scope,
+                            user_login: None,
+                            user_avatar_url: None,
                         };
 
                         this.notice = match this.persist_github_auth_state() {
@@ -5210,8 +5213,8 @@ impl ArborWindow {
             };
 
             match client.create_or_attach(CreateOrAttachRequest {
-                session_id: String::new(),
-                workspace_id: cwd.display().to_string(),
+                session_id: String::new().into(),
+                workspace_id: cwd.display().to_string().into(),
                 cwd: cwd.clone(),
                 shell,
                 cols: 120,
@@ -5221,7 +5224,7 @@ impl ArborWindow {
             }) {
                 Ok(response) => {
                     let daemon_session = response.session;
-                    session.daemon_session_id = daemon_session.session_id.clone();
+                    session.daemon_session_id = daemon_session.session_id.to_string();
                     session.title = daemon_session
                         .title
                         .clone()
@@ -5237,7 +5240,7 @@ impl ArborWindow {
                     session.rows = daemon_session.rows.max(1);
                     session.runtime = Some(local_daemon_runtime(
                         client,
-                        daemon_session.session_id.clone(),
+                        daemon_session.session_id.to_string(),
                         Some(self.terminal_poll_tx.clone()),
                     ));
                 },
@@ -8765,8 +8768,8 @@ impl ArborWindow {
         {
             let shell = self.embedded_shell();
             match daemon.create_or_attach(CreateOrAttachRequest {
-                session_id: String::new(),
-                workspace_id: cwd.display().to_string(),
+                session_id: String::new().into(),
+                workspace_id: cwd.display().to_string().into(),
                 cwd: cwd.clone(),
                 shell,
                 cols: 120,
@@ -8776,7 +8779,7 @@ impl ArborWindow {
             }) {
                 Ok(response) => {
                     let daemon_session = response.session;
-                    session.daemon_session_id = daemon_session.session_id.clone();
+                    session.daemon_session_id = daemon_session.session_id.to_string();
                     session.title = daemon_session
                         .title
                         .clone()
@@ -8792,7 +8795,7 @@ impl ArborWindow {
                     session.rows = daemon_session.rows.max(1);
                     session.runtime = Some(local_daemon_runtime(
                         daemon.clone(),
-                        daemon_session.session_id.clone(),
+                        daemon_session.session_id.to_string(),
                         Some(self.terminal_poll_tx.clone()),
                     ));
                     launched_with_daemon = true;
@@ -9980,6 +9983,7 @@ impl ArborWindow {
             }),
             left_pane_visible: Some(self.left_pane_visible),
             preferred_checkout_kind: Some(self.preferred_checkout_kind),
+            sidebar_order: self.last_persisted_ui_state.sidebar_order.clone(),
         }
     }
 
