@@ -6,31 +6,34 @@ if ! command -v zig >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ -z "${ARBOR_GHOSTTY_SRC:-}" ]; then
-  echo "error: ARBOR_GHOSTTY_SRC must point at a Ghostty source checkout" >&2
-  exit 1
-fi
-
-if [ ! -d "${ARBOR_GHOSTTY_SRC}" ]; then
-  echo "error: ARBOR_GHOSTTY_SRC does not exist: ${ARBOR_GHOSTTY_SRC}" >&2
-  exit 1
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEFAULT_GHOSTTY_SRC="${REPO_ROOT}/vendor/ghostty"
+GHOSTTY_SRC="${ARBOR_GHOSTTY_SRC:-${DEFAULT_GHOSTTY_SRC}}"
 OUT_DIR="${ARBOR_GHOSTTY_BRIDGE_OUT_DIR:-${REPO_ROOT}/target/ghostty-vt-bridge}"
 LIB_DIR="${OUT_DIR}/lib"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/arbor-ghostty-vt-XXXXXX")"
 STAGED_GHOSTTY_DIR="${BUILD_DIR}/ghostty"
 trap 'rm -rf "${BUILD_DIR}"' EXIT
 
+if [ ! -d "${GHOSTTY_SRC}" ]; then
+  echo "error: Ghostty source does not exist: ${GHOSTTY_SRC}" >&2
+  echo "hint: run 'git submodule update --init --recursive vendor/ghostty' or set ARBOR_GHOSTTY_SRC" >&2
+  exit 1
+fi
+
+if [ ! -f "${GHOSTTY_SRC}/build.zig" ]; then
+  echo "error: Ghostty source is missing build.zig: ${GHOSTTY_SRC}" >&2
+  exit 1
+fi
+
 mkdir -p "${STAGED_GHOSTTY_DIR}" "${LIB_DIR}"
 rm -f "${LIB_DIR}/libarbor_ghostty_vt_bridge".*
 
 if command -v rsync >/dev/null 2>&1; then
-  rsync -a --delete --exclude '.git' "${ARBOR_GHOSTTY_SRC}/" "${STAGED_GHOSTTY_DIR}/"
+  rsync -a --delete --exclude '.git' "${GHOSTTY_SRC}/" "${STAGED_GHOSTTY_DIR}/"
 else
-  cp -R "${ARBOR_GHOSTTY_SRC}/." "${STAGED_GHOSTTY_DIR}/"
+  cp -R "${GHOSTTY_SRC}/." "${STAGED_GHOSTTY_DIR}/"
   rm -rf "${STAGED_GHOSTTY_DIR}/.git"
 fi
 

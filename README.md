@@ -201,14 +201,15 @@ Then install the [CaskaydiaMono Nerd Font](https://www.nerdfonts.com/font-downlo
 Arbor can also be built with an experimental embedded Ghostty terminal engine.
 This is opt-in, disabled by default, and currently expects:
 
+- the pinned `vendor/ghostty` submodule checked out
 - `zig` on `PATH`
-- `ARBOR_GHOSTTY_SRC=/path/to/ghostty` pointing at a Ghostty source checkout
 - a prebuilt `arbor_ghostty_vt_bridge` shared library in `target/ghostty-vt-bridge/lib`
+- optionally, `ARBOR_GHOSTTY_SRC=/path/to/ghostty` to override the pinned submodule
 
 Example:
 
 ```bash
-export ARBOR_GHOSTTY_SRC=/path/to/ghostty
+git submodule update --init --recursive vendor/ghostty
 just ghostty-vt-bridge
 RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib" \
   cargo +nightly-2025-11-30 run -p arbor-gui --features ghostty-vt-experimental
@@ -217,7 +218,7 @@ RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,
 To run the experimental checks:
 
 ```bash
-export ARBOR_GHOSTTY_SRC=/path/to/ghostty
+git submodule update --init --recursive vendor/ghostty
 just test-ghostty-vt
 just check-ghostty-vt-gui
 just check-ghostty-vt-httpd
@@ -226,7 +227,7 @@ just check-ghostty-vt-httpd
 To build the daemon with the same terminal engine:
 
 ```bash
-export ARBOR_GHOSTTY_SRC=/path/to/ghostty
+git submodule update --init --recursive vendor/ghostty
 just ghostty-vt-bridge
 RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib" \
   cargo +nightly-2025-11-30 run -p arbor-httpd --features ghostty-vt-experimental

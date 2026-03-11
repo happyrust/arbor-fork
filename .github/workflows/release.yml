@@ -99,16 +99,11 @@ jobs:
     permissions:
       contents: read
     env:
-      ARBOR_GHOSTTY_SRC: ${{ github.workspace }}/ghostty-src
       RUSTFLAGS: -L native=${{ github.workspace }}/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,${{ github.workspace }}/target/ghostty-vt-bridge/lib
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          persist-credentials: false
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          repository: ghostty-org/ghostty
-          path: ghostty-src
+          submodules: recursive
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
