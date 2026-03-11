@@ -8,7 +8,7 @@ mod terminal_daemon;
 use {
     crate::{
         github_service::GitHubPrService,
-        process_manager::ProcessManager,
+        process_manager::{ProcessEvent, ProcessManager},
         terminal_daemon::{LocalTerminalDaemon, LocalTerminalDaemonError, SessionEvent},
     },
     arbor_core::{
@@ -251,10 +251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(env_filter);
+        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(env_filter.clone());
         let broadcast_layer = BroadcastLogLayer {
             sender: log_broadcast.clone(),
-        };
+        }
+        .with_filter(env_filter);
         tracing_subscriber::registry()
             .with(fmt_layer)
             .with(broadcast_layer)
@@ -1288,11 +1289,7 @@ async fn agent_activity_ws(State(state): State<AppState>, ws: WebSocketUpgrade) 
 }
 
 async fn handle_agent_activity_ws(state: AppState, mut socket: WebSocket) {
-    let snapshot = {
-        let mut sessions = state.agent_sessions.lock().await;
-        let dtos = agent_session_snapshot(&mut sessions);
-        AgentWsEvent::Snapshot { sessions: dtos }
-    };
+    let snapshot = agent_activity_snapshot_event(&state).await;
 
     if send_ws_json(&mut socket, &snapshot).await.is_err() {
         return;
@@ -1306,7 +1303,13 @@ async fn handle_agent_activity_ws(state: AppState, mut socket: WebSocket) {
                     break;
                 }
             },
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let snapshot = agent_activity_snapshot_event(&state).await;
+                if send_ws_json(&mut socket, &snapshot).await.is_err() {
+                    break;
+                }
+                rx = state.agent_broadcast.subscribe();
+            },
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
@@ -1337,6 +1340,12 @@ fn agent_session_snapshot(sessions: &mut HashMap<String, AgentSession>) -> Vec<A
         .collect();
     snapshot.sort_by(|left, right| left.cwd.cmp(&right.cwd));
     snapshot
+}
+
+async fn agent_activity_snapshot_event(state: &AppState) -> AgentWsEvent {
+    let mut sessions = state.agent_sessions.lock().await;
+    let dtos = agent_session_snapshot(&mut sessions);
+    AgentWsEvent::Snapshot { sessions: dtos }
 }
 
 /// Dynamic SPA fallback: serves `index.html` if it exists (for client-side
@@ -1887,10 +1896,7 @@ async fn process_status_ws(State(state): State<AppState>, ws: WebSocketUpgrade) 
 }
 
 async fn handle_process_status_ws(state: AppState, mut socket: WebSocket) {
-    let (snapshot, mut rx) = {
-        let pm = state.process_manager.lock().await;
-        (pm.snapshot_event(), pm.subscribe())
-    };
+    let (snapshot, mut rx) = process_status_snapshot_and_subscription(&state).await;
 
     if send_ws_json(&mut socket, &snapshot).await.is_err() {
         return;
@@ -1903,10 +1909,23 @@ async fn handle_process_status_ws(state: AppState, mut socket: WebSocket) {
                     break;
                 }
             },
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let (snapshot, next_rx) = process_status_snapshot_and_subscription(&state).await;
+                if send_ws_json(&mut socket, &snapshot).await.is_err() {
+                    break;
+                }
+                rx = next_rx;
+            },
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+async fn process_status_snapshot_and_subscription(
+    state: &AppState,
+) -> (ProcessEvent, tokio::sync::broadcast::Receiver<ProcessEvent>) {
+    let pm = state.process_manager.lock().await;
+    (pm.snapshot_event(), pm.subscribe())
 }
 
 // ---------------------------------------------------------------------------
@@ -2020,7 +2039,14 @@ async fn handle_logs_ws(state: AppState, mut socket: WebSocket) {
                     "message": format!("log stream lagged, skipped {n} entries"),
                     "fields": "",
                 });
-                let _ = socket.send(Message::Text(msg.to_string().into())).await;
+                if socket
+                    .send(Message::Text(msg.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                rx = state.log_broadcast.subscribe();
             },
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
