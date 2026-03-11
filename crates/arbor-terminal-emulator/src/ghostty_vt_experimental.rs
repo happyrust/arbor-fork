@@ -433,9 +433,9 @@ mod tests {
 
         emulator.process("prompt> ".as_bytes());
 
-        let cursor = emulator
-            .snapshot_cursor()
-            .expect("cursor should remain visible");
+        let Some(cursor) = emulator.snapshot_cursor() else {
+            panic!("cursor should remain visible");
+        };
         let styled_lines = emulator.collect_styled_lines();
 
         assert_eq!(

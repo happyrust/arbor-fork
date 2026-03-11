@@ -367,7 +367,7 @@ mod tests {
     }
 
     async fn create_raw_echo_session(state: &AppState, session_id: &str) -> String {
-        let cwd = match std::env::current_dir() {
+        let cwd = match env::current_dir() {
             Ok(cwd) => cwd,
             Err(error) => panic!("failed to read current directory: {error}"),
         };

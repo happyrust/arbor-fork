@@ -66,8 +66,9 @@ pub struct TerminalStyledRun {
 
 pub use alacritty_support::process_terminal_bytes;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalEngineKind {
+    #[default]
     Alacritty,
     #[cfg(feature = "ghostty-vt-experimental")]
     GhosttyVtExperimental,
@@ -80,12 +81,6 @@ impl TerminalEngineKind {
             #[cfg(feature = "ghostty-vt-experimental")]
             Self::GhosttyVtExperimental => "ghostty-vt-experimental",
         }
-    }
-}
-
-impl Default for TerminalEngineKind {
-    fn default() -> Self {
-        Self::Alacritty
     }
 }
 
@@ -149,7 +144,7 @@ const fn available_terminal_engine_suffix() -> &'static str {
 }
 
 enum TerminalEmulatorInner {
-    Alacritty(alacritty_emulator::TerminalEmulator),
+    Alacritty(Box<alacritty_emulator::TerminalEmulator>),
     #[cfg(feature = "ghostty-vt-experimental")]
     Ghostty(ghostty_vt_experimental::TerminalEmulator),
 }
@@ -169,9 +164,9 @@ impl TerminalEmulator {
 
     pub fn with_engine(engine: TerminalEngineKind, rows: u16, cols: u16) -> Self {
         let inner = match engine {
-            TerminalEngineKind::Alacritty => TerminalEmulatorInner::Alacritty(
+            TerminalEngineKind::Alacritty => TerminalEmulatorInner::Alacritty(Box::new(
                 alacritty_emulator::TerminalEmulator::with_size(rows, cols),
-            ),
+            )),
             #[cfg(feature = "ghostty-vt-experimental")]
             TerminalEngineKind::GhosttyVtExperimental => TerminalEmulatorInner::Ghostty(
                 ghostty_vt_experimental::TerminalEmulator::with_size(rows, cols),
