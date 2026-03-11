@@ -463,7 +463,12 @@ fn main() {
 
     tracing::info!("Arbor starting");
 
-    Application::new().run(move |cx: &mut App| {
+    let mut application = Application::new();
+    if let Some(assets_base) = find_assets_root_dir() {
+        application = application.with_assets(ArborAssets { base: assets_base });
+    }
+
+    application.run(move |cx: &mut App| {
         register_bundled_fonts(cx);
         set_dock_icon();
         cx.set_http_client(simple_http_client::create_http_client());

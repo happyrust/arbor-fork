@@ -163,6 +163,14 @@ impl ArborWindow {
                         TerminalBackendKind::Embedded
                     },
                 };
+                let embedded_terminal_engine = resolve_embedded_terminal_engine(
+                    loaded_config.config.embedded_terminal_engine.as_deref(),
+                    &mut notice_parts,
+                );
+                tracing::info!(
+                    terminal_engine = embedded_terminal_engine.as_str(),
+                    "configured embedded terminal engine",
+                );
                 let theme_kind = match parse_theme_kind(loaded_config.config.theme.as_deref()) {
                     Ok(kind) => kind,
                     Err(err) => {
@@ -500,6 +508,14 @@ impl ArborWindow {
                     TerminalBackendKind::Embedded
                 },
             };
+        let embedded_terminal_engine = resolve_embedded_terminal_engine(
+            loaded_config.config.embedded_terminal_engine.as_deref(),
+            &mut notice_parts,
+        );
+        tracing::info!(
+            terminal_engine = embedded_terminal_engine.as_str(),
+            "configured embedded terminal engine",
+        );
         let theme_kind = match parse_theme_kind(loaded_config.config.theme.as_deref()) {
             Ok(kind) => kind,
             Err(error) => {
@@ -932,6 +948,15 @@ impl ArborWindow {
             },
             Err(error) => notices.push(error),
         }
+
+        let next_engine = resolve_embedded_terminal_engine(
+            loaded.config.embedded_terminal_engine.as_deref(),
+            &mut notices,
+        );
+        tracing::info!(
+            terminal_engine = next_engine.as_str(),
+            "reloaded embedded terminal engine",
+        );
 
         if self.configured_embedded_shell != loaded.config.embedded_shell {
             self.configured_embedded_shell = loaded.config.embedded_shell.clone();
