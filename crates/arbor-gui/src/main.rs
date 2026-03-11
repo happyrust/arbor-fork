@@ -7209,7 +7209,7 @@ fn shell_quote(value: &str) -> String {
     #[cfg(target_os = "windows")]
     {
         let escaped = value.replace('"', "\"\"");
-        return format!("\"{escaped}\"");
+        format!("\"{escaped}\"")
     }
 
     #[cfg(not(target_os = "windows"))]
