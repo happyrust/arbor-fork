@@ -8,6 +8,8 @@ mod routes;
 mod terminal_daemon;
 mod types;
 
+#[cfg(feature = "symphony")]
+use arbor_symphony::{ServiceOptions, SymphonyService};
 pub(crate) use types::*;
 use {
     crate::{process_manager::ProcessManager, routes::*, terminal_daemon::LocalTerminalDaemon},
@@ -23,7 +25,7 @@ use {
 };
 
 fn router(state: AppState) -> Router {
-    let api = Router::new()
+    let mut api = Router::new()
         .route("/health", get(health))
         .route("/repositories", get(list_repositories))
         .route("/worktrees", get(list_worktrees).post(create_worktree))
@@ -55,6 +57,14 @@ fn router(state: AppState) -> Router {
         .route("/shutdown", post(shutdown_daemon))
         .route("/config/bind", post(set_bind_mode).get(get_bind_mode))
         .route("/logs/ws", get(logs_ws));
+
+    #[cfg(feature = "symphony")]
+    {
+        api = api
+            .route("/symphony/state", get(symphony_state))
+            .route("/symphony/refresh", post(symphony_refresh))
+            .route("/symphony/{issue_identifier}", get(symphony_issue));
+    }
 
     let with_state = Router::new().nest("/api/v1", api).with_state(state);
 
@@ -151,10 +161,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pm
     };
 
+    #[cfg(feature = "symphony")]
+    let symphony = start_symphony_if_configured().await;
+
     let state = AppState {
         repository_store: repository_store.clone(),
         daemon: Arc::new(Mutex::new(LocalTerminalDaemon::new(daemon_store))),
         process_manager: Arc::new(Mutex::new(process_manager)),
+        #[cfg(feature = "symphony")]
+        symphony,
         github_service: github_service::default_github_pr_service(),
         agent_sessions: Arc::new(Mutex::new(HashMap::new())),
         agent_broadcast,
@@ -270,6 +285,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(feature = "symphony")]
+async fn start_symphony_if_configured() -> Option<arbor_symphony::ServiceHandle> {
+    let workflow_path = env::var("ARBOR_SYMPHONY_WORKFLOW")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::current_dir()
+                .ok()
+                .map(|cwd| cwd.join("WORKFLOW.md"))
+                .filter(|path| path.exists())
+        });
+
+    let Some(workflow_path) = workflow_path else {
+        tracing::info!("symphony workflow not found; service disabled");
+        return None;
+    };
+
+    match SymphonyService::start(ServiceOptions {
+        workflow_path: Some(workflow_path.clone()),
+        ..ServiceOptions::default()
+    })
+    .await
+    {
+        Ok(handle) => {
+            tracing::info!(path = %workflow_path.display(), "symphony service started");
+            Some(handle)
+        },
+        Err(error) => {
+            tracing::error!(%error, path = %workflow_path.display(), "failed to start symphony service");
+            None
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -281,11 +330,22 @@ mod tests {
         arbor_core::daemon::{CreateOrAttachRequest, KillRequest, TerminalDaemon},
         axum::{
             Json,
-            body::Bytes,
+            body::{Body, Bytes, to_bytes},
             extract::{Path as AxumPath, State, ws::Message},
-            http::StatusCode,
+            http::{Request, StatusCode},
         },
         std::time::Duration,
+    };
+    #[cfg(feature = "symphony")]
+    use {
+        arbor_symphony::{
+            Issue, IssueRuntimeSnapshot, IssueTracker, RuntimeSnapshot, ServiceOptions,
+            SymphonyService, TrackerError,
+            codex::{RunAttemptRequest, RunOutcome, RunResult, Runner, RunnerError, RunnerEvent},
+        },
+        async_trait::async_trait,
+        std::sync::{Arc, Mutex as StdMutex},
+        tower::ServiceExt,
     };
 
     #[tokio::test]
@@ -381,6 +441,218 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "symphony")]
+    #[derive(Default)]
+    struct MockSymphonyTracker {
+        issues: StdMutex<Vec<Issue>>,
+    }
+
+    #[cfg(feature = "symphony")]
+    #[async_trait]
+    impl IssueTracker for MockSymphonyTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
+            match self.issues.lock() {
+                Ok(issues) => Ok(issues.clone()),
+                Err(error) => Err(TrackerError::LinearApiRequest(error.to_string())),
+            }
+        }
+
+        async fn fetch_issues_by_states(
+            &self,
+            _states: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            issue_ids: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            match self.issues.lock() {
+                Ok(issues) => Ok(issues
+                    .iter()
+                    .filter(|issue| issue_ids.contains(&issue.id))
+                    .cloned()
+                    .collect()),
+                Err(error) => Err(TrackerError::LinearApiRequest(error.to_string())),
+            }
+        }
+    }
+
+    #[cfg(feature = "symphony")]
+    #[derive(Default)]
+    struct MockSymphonyRunner;
+
+    #[cfg(feature = "symphony")]
+    #[async_trait]
+    impl Runner for MockSymphonyRunner {
+        async fn run_attempt(
+            &self,
+            _request: RunAttemptRequest,
+            events: tokio::sync::mpsc::UnboundedSender<RunnerEvent>,
+        ) -> Result<RunResult, RunnerError> {
+            let _ = events.send(RunnerEvent {
+                event: "turn/completed".to_owned(),
+                at: "test".to_owned(),
+                ..RunnerEvent::default()
+            });
+            Ok(RunResult {
+                outcome: RunOutcome::Completed,
+                ..RunResult::default()
+            })
+        }
+    }
+
+    #[cfg(feature = "symphony")]
+    #[tokio::test]
+    async fn symphony_routes_return_state_and_issue_snapshots() {
+        let temp = match tempfile::tempdir() {
+            Ok(temp) => temp,
+            Err(error) => panic!("failed to create temp dir: {error}"),
+        };
+        let workflow_path = temp.path().join("WORKFLOW.md");
+        let workflow = format!(
+            "---\ntracker:\n  kind: linear\n  api_key: token\n  project_slug: arbor\nworkspace:\n  root: {}\ncodex:\n  command: codex app-server\n---\nIssue {{{{ issue.identifier }}}}",
+            temp.path().join("workspaces").display()
+        );
+        if let Err(error) = std::fs::write(&workflow_path, workflow) {
+            panic!("failed to write workflow: {error}");
+        }
+
+        let symphony = match SymphonyService::start(ServiceOptions {
+            workflow_path: Some(workflow_path),
+            runner: Arc::new(MockSymphonyRunner),
+            tracker: Some(Arc::new(MockSymphonyTracker {
+                issues: StdMutex::new(vec![Issue {
+                    id: "1".to_owned(),
+                    identifier: "ARB-1".to_owned(),
+                    title: "Ready".to_owned(),
+                    state: "Todo".to_owned(),
+                    ..Issue::default()
+                }]),
+            })),
+        })
+        .await
+        {
+            Ok(handle) => handle,
+            Err(error) => panic!("failed to start symphony service: {error}"),
+        };
+
+        let state = test_app_state(temp.path().to_path_buf()).with_symphony(symphony.clone());
+        let app = router(state);
+
+        let refresh_request = match Request::builder()
+            .method("POST")
+            .uri("/api/v1/symphony/refresh")
+            .body(Body::empty())
+        {
+            Ok(request) => request,
+            Err(error) => panic!("failed to build refresh request: {error}"),
+        };
+        let refresh_response = match app.clone().oneshot(refresh_request).await {
+            Ok(response) => response,
+            Err(error) => panic!("refresh route failed: {error}"),
+        };
+        assert_eq!(refresh_response.status(), StatusCode::OK);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let state_request = match Request::builder()
+            .uri("/api/v1/symphony/state")
+            .body(Body::empty())
+        {
+            Ok(request) => request,
+            Err(error) => panic!("failed to build state request: {error}"),
+        };
+        let state_response = match app.clone().oneshot(state_request).await {
+            Ok(response) => response,
+            Err(error) => panic!("state route failed: {error}"),
+        };
+        assert_eq!(state_response.status(), StatusCode::OK);
+        let state_body = match to_bytes(state_response.into_body(), usize::MAX).await {
+            Ok(body) => body,
+            Err(error) => panic!("failed to read state body: {error}"),
+        };
+        let snapshot: RuntimeSnapshot = match serde_json::from_slice(&state_body) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("failed to decode state snapshot: {error}"),
+        };
+        assert!(
+            !snapshot.retrying.is_empty(),
+            "expected retrying entry after run"
+        );
+
+        let issue_request = match Request::builder()
+            .uri("/api/v1/symphony/ARB-1")
+            .body(Body::empty())
+        {
+            Ok(request) => request,
+            Err(error) => panic!("failed to build issue request: {error}"),
+        };
+        let issue_response = match app.oneshot(issue_request).await {
+            Ok(response) => response,
+            Err(error) => panic!("issue route failed: {error}"),
+        };
+        assert_eq!(issue_response.status(), StatusCode::OK);
+        let issue_body = match to_bytes(issue_response.into_body(), usize::MAX).await {
+            Ok(body) => body,
+            Err(error) => panic!("failed to read issue body: {error}"),
+        };
+        let issue: IssueRuntimeSnapshot = match serde_json::from_slice(&issue_body) {
+            Ok(issue) => issue,
+            Err(error) => panic!("failed to decode issue snapshot: {error}"),
+        };
+        assert_eq!(issue.issue_identifier, "ARB-1");
+
+        let _ = symphony.stop();
+    }
+
+    #[cfg(feature = "symphony")]
+    #[tokio::test]
+    async fn symphony_issue_route_returns_not_found_for_unknown_issue() {
+        let temp = match tempfile::tempdir() {
+            Ok(temp) => temp,
+            Err(error) => panic!("failed to create temp dir: {error}"),
+        };
+        let workflow_path = temp.path().join("WORKFLOW.md");
+        let workflow = format!(
+            "---\ntracker:\n  kind: linear\n  api_key: token\n  project_slug: arbor\nworkspace:\n  root: {}\ncodex:\n  command: codex app-server\n---\nIssue {{{{ issue.identifier }}}}",
+            temp.path().join("workspaces").display()
+        );
+        if let Err(error) = std::fs::write(&workflow_path, workflow) {
+            panic!("failed to write workflow: {error}");
+        }
+
+        let symphony = match SymphonyService::start(ServiceOptions {
+            workflow_path: Some(workflow_path),
+            runner: Arc::new(MockSymphonyRunner),
+            tracker: Some(Arc::new(MockSymphonyTracker::default())),
+        })
+        .await
+        {
+            Ok(handle) => handle,
+            Err(error) => panic!("failed to start symphony service: {error}"),
+        };
+
+        let state = test_app_state(temp.path().to_path_buf()).with_symphony(symphony.clone());
+        let app = router(state);
+        let request = match Request::builder()
+            .uri("/api/v1/symphony/ARB-404")
+            .body(Body::empty())
+        {
+            Ok(request) => request,
+            Err(error) => panic!("failed to build issue request: {error}"),
+        };
+
+        let response = match app.oneshot(request).await {
+            Ok(response) => response,
+            Err(error) => panic!("issue route failed: {error}"),
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let _ = symphony.stop();
+    }
+
     fn test_app_state(repo_root: PathBuf) -> AppState {
         let daemon_store = JsonDaemonSessionStore::new(repo_root.join("daemon-sessions.json"));
         let repository_store = Arc::new(JsonRepositoryStore::new(
@@ -393,6 +665,8 @@ mod tests {
             repository_store,
             daemon: Arc::new(Mutex::new(LocalTerminalDaemon::new(daemon_store))),
             process_manager: Arc::new(Mutex::new(ProcessManager::new(repo_root))),
+            #[cfg(feature = "symphony")]
+            symphony: None,
             github_service: github_service::default_github_pr_service(),
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
             agent_broadcast,
@@ -401,6 +675,19 @@ mod tests {
             repo_cache: Arc::new(Mutex::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             auth_state: auth::AuthState::new(None, false),
+        }
+    }
+
+    #[cfg(feature = "symphony")]
+    trait TestAppStateExt {
+        fn with_symphony(self, symphony: arbor_symphony::ServiceHandle) -> Self;
+    }
+
+    #[cfg(feature = "symphony")]
+    impl TestAppStateExt for AppState {
+        fn with_symphony(mut self, symphony: arbor_symphony::ServiceHandle) -> Self {
+            self.symphony = Some(symphony);
+            self
         }
     }
 

@@ -55,6 +55,53 @@ pub(crate) async fn health() -> Json<HealthResponse> {
     })
 }
 
+#[cfg(feature = "symphony")]
+pub(crate) async fn symphony_state(
+    State(state): State<AppState>,
+) -> ApiResult<arbor_symphony::RuntimeSnapshot> {
+    let Some(service) = state.symphony.clone() else {
+        return Err(internal_error("symphony service is disabled"));
+    };
+    Ok(Json(service.snapshot().await))
+}
+
+#[cfg(feature = "symphony")]
+pub(crate) async fn symphony_issue(
+    State(state): State<AppState>,
+    AxumPath(issue_identifier): AxumPath<String>,
+) -> ApiResult<arbor_symphony::IssueRuntimeSnapshot> {
+    let Some(service) = state.symphony.clone() else {
+        return Err(internal_error("symphony service is disabled"));
+    };
+    service
+        .issue_snapshot(&issue_identifier)
+        .await
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "issue_not_found".to_owned(),
+                }),
+            )
+        })
+}
+
+#[cfg(feature = "symphony")]
+pub(crate) async fn symphony_refresh(
+    State(state): State<AppState>,
+) -> ApiResult<serde_json::Value> {
+    let Some(service) = state.symphony.clone() else {
+        return Err(internal_error("symphony service is disabled"));
+    };
+    service.refresh().map_err(internal_error)?;
+    Ok(Json(serde_json::json!({
+        "queued": true,
+        "requested_at": current_unix_timestamp_millis(),
+        "operations": ["poll", "reconcile"],
+    })))
+}
+
 pub(crate) async fn shutdown_daemon(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     State(state): State<AppState>,
