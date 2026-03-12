@@ -261,6 +261,24 @@ impl DaemonClient {
         ))
     }
 
+    pub fn symphony_state(&self) -> Result<arbor_symphony::RuntimeSnapshot, DaemonClientError> {
+        self.get_json("/api/v1/symphony/state")
+    }
+
+    pub fn symphony_issue(
+        &self,
+        issue_identifier: &str,
+    ) -> Result<arbor_symphony::IssueRuntimeSnapshot, DaemonClientError> {
+        self.get_json(&format!(
+            "/api/v1/symphony/{}",
+            encode_path_segment(issue_identifier)
+        ))
+    }
+
+    pub fn refresh_symphony(&self) -> Result<serde_json::Value, DaemonClientError> {
+        self.post_empty_json("/api/v1/symphony/refresh")
+    }
+
     pub fn list_tasks(&self) -> Result<Vec<TaskInfo>, DaemonClientError> {
         self.get_json("/api/v1/tasks")
     }

@@ -211,6 +211,8 @@ pub(crate) struct AppState {
     pub(crate) repository_store: Arc<dyn crate::repository_store::RepositoryStore>,
     pub(crate) daemon: Arc<Mutex<crate::terminal_daemon::LocalTerminalDaemon>>,
     pub(crate) process_manager: Arc<Mutex<crate::process_manager::ProcessManager>>,
+    #[cfg(feature = "symphony")]
+    pub(crate) symphony: Option<arbor_symphony::ServiceHandle>,
     pub(crate) task_scheduler: Arc<Mutex<crate::task_scheduler::TaskScheduler>>,
     pub(crate) github_service: Arc<dyn crate::github_service::GitHubPrService>,
     pub(crate) agent_sessions: Arc<Mutex<HashMap<String, AgentSession>>>,
