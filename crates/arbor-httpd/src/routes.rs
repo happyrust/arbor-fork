@@ -1491,7 +1491,7 @@ pub(crate) async fn run_task(
         if let Some(ref trigger) = task_request.trigger
             && task_scheduler::should_trigger(trigger, exit_code, &stdout)
             && let Some((program, args)) =
-                task_scheduler::build_agent_command(trigger, &stdout, &task_request.working_dir)
+                task_scheduler::build_agent_command(trigger, &stdout, &task_request.repo_root)
             && task_scheduler::spawn_agent(&program, &args, &task_request.working_dir)
                 .await
                 .is_ok()

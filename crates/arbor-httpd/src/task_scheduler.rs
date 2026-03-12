@@ -1,10 +1,11 @@
 use {
     arbor_core::task::{AgentKind, TaskExecution, TaskInfo, TaskStatus},
-    chrono::Utc,
+    chrono::{DateTime, Timelike, Utc},
     cron::Schedule,
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
+        ffi::OsString,
         path::{Path, PathBuf},
         str::FromStr,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -89,33 +90,24 @@ impl ManagedTask {
     }
 
     fn is_due(&self) -> bool {
+        self.is_due_at(Utc::now())
+    }
+
+    fn is_due_at(&self, now: DateTime<Utc>) -> bool {
         if self.status != TaskStatus::Idle {
             return false;
         }
-        let Some(ref schedule) = self.schedule else {
+        let Some(schedule) = self.schedule.as_ref() else {
             return false;
         };
-        let now = Utc::now();
-        // Check if the most recent scheduled time is after our last run
-        let Some(upcoming) = schedule.upcoming(Utc).next() else {
+
+        let now = now.with_nanosecond(0).unwrap_or(now);
+        let Some(last_due) = latest_scheduled_time(schedule, now) else {
             return false;
         };
-        // Task is due if next run is within 60 seconds from now
-        // (we check every 30 seconds, so this gives a safe window)
-        let until_next = upcoming.signed_duration_since(now);
-        if until_next.num_seconds() > 60 {
-            return false;
-        }
-        // Don't re-run if we already ran within this schedule window
-        if let Some(last_run_ms) = self.last_run_unix_ms {
-            let last_run_secs = last_run_ms / 1000;
-            let now_secs = now.timestamp() as u64;
-            // If we ran less than 60 seconds ago, skip
-            if now_secs.saturating_sub(last_run_secs) < 60 {
-                return false;
-            }
-        }
-        true
+
+        self.last_run_unix_ms
+            .is_none_or(|last_run_ms| last_run_ms < last_due.timestamp_millis() as u64)
     }
 
     fn push_execution(&mut self, execution: TaskExecution) {
@@ -139,6 +131,7 @@ pub enum TaskEvent {
 pub struct TaskRunRequest {
     pub name: String,
     pub command: String,
+    pub repo_root: PathBuf,
     pub working_dir: PathBuf,
     pub trigger: Option<TriggerConfig>,
 }
@@ -219,6 +212,7 @@ impl TaskScheduler {
             due.push(TaskRunRequest {
                 name: task.config.name.clone(),
                 command: task.config.command.clone(),
+                repo_root: self.repo_root.clone(),
                 working_dir,
                 trigger: task.config.trigger.clone(),
             });
@@ -291,6 +285,7 @@ impl TaskScheduler {
         Ok(TaskRunRequest {
             name: task.config.name.clone(),
             command: task.config.command.clone(),
+            repo_root: self.repo_root.clone(),
             working_dir,
             trigger: task.config.trigger.clone(),
         })
@@ -306,8 +301,9 @@ impl TaskScheduler {
 
 /// Execute a task command, returning (exit_code, stdout).
 pub async fn execute_task(command: &str, working_dir: &Path) -> (i32, String) {
-    let result = tokio::process::Command::new("sh")
-        .arg("-c")
+    let (shell, shell_arg) = task_shell();
+    let result = tokio::process::Command::new(shell)
+        .arg(shell_arg)
         .arg(command)
         .current_dir(working_dir)
         .stdout(std::process::Stdio::piped())
@@ -318,10 +314,7 @@ pub async fn execute_task(command: &str, working_dir: &Path) -> (i32, String) {
     match result {
         Ok(output) => {
             let exit_code = output.status.code().unwrap_or(-1);
-            let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if stdout.len() > MAX_STDOUT_TAIL_BYTES {
-                stdout = stdout[stdout.len() - MAX_STDOUT_TAIL_BYTES..].to_owned();
-            }
+            let stdout = truncate_stdout_tail(String::from_utf8_lossy(&output.stdout).into_owned());
             (exit_code, stdout)
         },
         Err(error) => (-1, format!("failed to execute command: {error}")),
@@ -422,10 +415,7 @@ pub fn load_task_configs(repo_root: &Path) -> Vec<TaskConfig> {
 }
 
 /// Full background loop: check schedule, execute, trigger agent.
-pub async fn run_task_loop(
-    scheduler: std::sync::Arc<tokio::sync::Mutex<TaskScheduler>>,
-    repo_root: PathBuf,
-) {
+pub async fn run_task_loop(scheduler: std::sync::Arc<tokio::sync::Mutex<TaskScheduler>>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
 
     loop {
@@ -438,7 +428,6 @@ pub async fn run_task_loop(
 
         for task_request in due_tasks {
             let scheduler = scheduler.clone();
-            let repo_root = repo_root.clone();
 
             tokio::spawn(async move {
                 let started_at_ms = SystemTime::now()
@@ -466,7 +455,8 @@ pub async fn run_task_loop(
 
                 if let Some(ref trigger) = task_request.trigger
                     && should_trigger(trigger, exit_code, &stdout)
-                    && let Some((program, args)) = build_agent_command(trigger, &stdout, &repo_root)
+                    && let Some((program, args)) =
+                        build_agent_command(trigger, &stdout, &task_request.repo_root)
                     && spawn_agent(&program, &args, &task_request.working_dir)
                         .await
                         .is_ok()
@@ -490,5 +480,117 @@ pub async fn run_task_loop(
                 );
             });
         }
+    }
+}
+
+fn latest_scheduled_time(schedule: &Schedule, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if schedule.includes(now) {
+        Some(now)
+    } else {
+        schedule.after(&now).next_back()
+    }
+}
+
+fn truncate_stdout_tail(mut stdout: String) -> String {
+    if stdout.len() <= MAX_STDOUT_TAIL_BYTES {
+        return stdout;
+    }
+
+    let mut start = stdout.len() - MAX_STDOUT_TAIL_BYTES;
+    while !stdout.is_char_boundary(start) {
+        start += 1;
+    }
+    stdout.drain(..start);
+    stdout
+}
+
+fn task_shell() -> (OsString, &'static str) {
+    #[cfg(windows)]
+    {
+        (
+            std::env::var_os("COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe")),
+            "/C",
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        (OsString::from("sh"), "-c")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        chrono::{LocalResult, TimeZone},
+    };
+
+    fn managed_task(schedule: &str) -> ManagedTask {
+        ManagedTask::from_config(TaskConfig {
+            name: "task".to_owned(),
+            schedule: schedule.to_owned(),
+            command: "echo hi".to_owned(),
+            ..TaskConfig::default()
+        })
+    }
+
+    fn utc_datetime(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    ) -> DateTime<Utc> {
+        match Utc.with_ymd_and_hms(year, month, day, hour, minute, second) {
+            LocalResult::Single(datetime) => datetime,
+            _ => panic!("invalid datetime"),
+        }
+    }
+
+    #[test]
+    fn cron_tasks_do_not_run_early() {
+        let mut task = managed_task("0 * * * * *");
+        task.last_run_unix_ms = Some(utc_datetime(2026, 3, 12, 10, 0, 0).timestamp_millis() as u64);
+
+        assert!(!task.is_due_at(utc_datetime(2026, 3, 12, 10, 0, 59)));
+        assert!(task.is_due_at(utc_datetime(2026, 3, 12, 10, 1, 0)));
+    }
+
+    #[test]
+    fn cron_tasks_support_sub_minute_schedules() {
+        let mut task = managed_task("*/30 * * * * *");
+        task.last_run_unix_ms = Some(utc_datetime(2026, 3, 12, 10, 0, 0).timestamp_millis() as u64);
+
+        assert!(!task.is_due_at(utc_datetime(2026, 3, 12, 10, 0, 29)));
+        assert!(task.is_due_at(utc_datetime(2026, 3, 12, 10, 0, 30)));
+    }
+
+    #[test]
+    fn stdout_tail_truncation_preserves_utf8_boundaries() {
+        let prefix = "x".repeat(MAX_STDOUT_TAIL_BYTES - 1);
+        let stdout = format!("{prefix}étail");
+
+        let truncated = truncate_stdout_tail(stdout);
+
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        assert!(truncated.ends_with("étail"));
+    }
+
+    #[test]
+    fn build_agent_command_uses_repo_root_placeholder() {
+        let trigger = TriggerConfig {
+            agent: Some(AgentKind::Codex),
+            prompt_template: Some("repo={repo_root} stdout={stdout}".to_owned()),
+            ..TriggerConfig::default()
+        };
+
+        let Some((_program, args)) = build_agent_command(&trigger, "done", Path::new("/repo"))
+        else {
+            panic!("trigger should build");
+        };
+
+        assert!(args.iter().any(|arg| arg.contains("repo=/repo")));
     }
 }

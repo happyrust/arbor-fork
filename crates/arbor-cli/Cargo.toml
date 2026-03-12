@@ -6,7 +6,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "arbor"
+name = "arbor-cli"
 path = "src/main.rs"
 
 [features]

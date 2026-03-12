@@ -160,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Initialize task scheduler — load [[tasks]] from arbor.toml
-    let (task_scheduler, task_repo_root) = {
+    let task_scheduler = {
         let roots = repository_store.load_roots().unwrap_or_default();
         let resolved = repository_store::resolve_repository_roots(roots);
         let repo_root = resolved
@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         ts.load_configs(configs);
-        (ts, repo_root)
+        ts
     };
 
     let state = AppState {
@@ -270,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn background task to run scheduled tasks
     {
         let scheduler = state.task_scheduler.clone();
-        tokio::spawn(task_scheduler::run_task_loop(scheduler, task_repo_root));
+        tokio::spawn(task_scheduler::run_task_loop(scheduler));
     }
 
     let shutdown_signal = state.shutdown_signal.clone();
