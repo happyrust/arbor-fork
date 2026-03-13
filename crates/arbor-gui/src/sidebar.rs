@@ -1125,6 +1125,7 @@ impl ArborWindow {
                                 let mut wt_rows: Vec<AnyElement> = Vec::new();
                                 for wt in &repo_wts {
                                     let branch = wt.branch.clone();
+                                    let click_repo_root = wt.repo_root.clone();
                                     let dir_label = wt.path.rsplit('/').next()
                                         .unwrap_or(&wt.path).to_owned();
                                     let additions = wt.diff_additions.unwrap_or(0);
@@ -1152,6 +1153,7 @@ impl ArborWindow {
                                                     this.select_remote_worktree(
                                                         daemon_index,
                                                         click_path.clone(),
+                                                        click_repo_root.clone(),
                                                         window,
                                                         cx,
                                                     );

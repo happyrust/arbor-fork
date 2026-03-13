@@ -1,40 +1,9 @@
 impl ArborWindow {
-    fn open_remote_create_modal(
-        &mut self,
-        daemon_url: String,
-        hostname: String,
-        repo_root: String,
-        cx: &mut Context<Self>,
-    ) {
-        tracing::info!(
-            url = %daemon_url,
-            host = %hostname,
-            repo = %repo_root,
-            "opening create modal on remote daemon"
-        );
-        connection_history::record_connection(&daemon_url, Some(&hostname));
-        self.connection_history = connection_history::load_history();
-        let connected = self.connect_to_daemon_endpoint(&daemon_url, Some(hostname), None, cx);
-        if connected {
-            if let Some(repo_index) = self
-                .repositories
-                .iter()
-                .position(|repository| repository.root.to_string_lossy().ends_with(&repo_root))
-            {
-                self.select_repository(repo_index, cx);
-                self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
-            } else if let Some(repo_index) = self.repositories.first().map(|_| 0) {
-                self.select_repository(repo_index, cx);
-                self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
-            }
-        }
-    }
-
-    fn select_remote_worktree(
+    fn activate_remote_worktree(
         &mut self,
         daemon_index: usize,
         worktree_path: String,
-        window: &mut Window,
+        repo_root: String,
         cx: &mut Context<Self>,
     ) {
         let Some(state) = self.remote_daemon_states.get(&daemon_index) else {
@@ -46,7 +15,8 @@ impl ArborWindow {
         tracing::info!(
             host = %hostname,
             path = %worktree_path,
-            "selecting remote worktree (keeping local daemon)"
+            repo = %repo_root,
+            "activating remote worktree (keeping local daemon)"
         );
 
         let cwd = PathBuf::from(&worktree_path);
@@ -55,6 +25,7 @@ impl ArborWindow {
         self.active_remote_worktree = Some(ActiveRemoteWorktree {
             daemon_index,
             worktree_path: cwd.clone(),
+            repo_root,
         });
         let has_terminal = self
             .terminals
@@ -139,7 +110,51 @@ impl ArborWindow {
             self.terminals.push(session);
         }
 
+        self.sync_issue_target(cx);
         self.terminal_scroll_handle.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn open_remote_create_modal(
+        &mut self,
+        daemon_url: String,
+        hostname: String,
+        repo_root: String,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::info!(
+            url = %daemon_url,
+            host = %hostname,
+            repo = %repo_root,
+            "opening create modal on remote daemon"
+        );
+        connection_history::record_connection(&daemon_url, Some(&hostname));
+        self.connection_history = connection_history::load_history();
+        let connected = self.connect_to_daemon_endpoint(&daemon_url, Some(hostname), None, cx);
+        if connected {
+            if let Some(repo_index) = self
+                .repositories
+                .iter()
+                .position(|repository| repository.root.to_string_lossy().ends_with(&repo_root))
+            {
+                self.select_repository(repo_index, cx);
+                self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
+            } else if let Some(repo_index) = self.repositories.first().map(|_| 0) {
+                self.select_repository(repo_index, cx);
+                self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
+            }
+        }
+    }
+
+    fn select_remote_worktree(
+        &mut self,
+        daemon_index: usize,
+        worktree_path: String,
+        repo_root: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_remote_worktree(daemon_index, worktree_path, repo_root, cx);
         window.focus(&self.terminal_focus);
         cx.notify();
     }
@@ -168,8 +183,8 @@ impl ArborWindow {
         let url = daemon.base_url();
         let hostname = daemon.display_name().to_owned();
 
-        let client = match terminal_daemon_http::HttpTerminalDaemon::new(&url) {
-            Ok(client) => Arc::new(client),
+        let client = match terminal_daemon_http::default_terminal_daemon_client(&url) {
+            Ok(client) => client,
             Err(error) => {
                 tracing::error!(%error, %url, "failed to create HTTP client for LAN daemon");
                 return;

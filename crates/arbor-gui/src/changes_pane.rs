@@ -3,12 +3,18 @@ impl ArborWindow {
         let theme = self.theme();
         let content: Div = match self.right_pane_tab {
             RightPaneTab::Changes => self.render_changes_content(cx),
+            RightPaneTab::Issues => self.render_issues_content(cx),
             RightPaneTab::FileTree => self.render_file_tree(cx),
             RightPaneTab::Notes => self.render_notes_content(cx),
         };
         let search_active = self.right_pane_search_active;
         let search_text = self.right_pane_search.clone();
         let show_search = self.right_pane_tab != RightPaneTab::Notes;
+        let search_placeholder = match self.right_pane_tab {
+            RightPaneTab::Changes | RightPaneTab::FileTree => "Filter files…",
+            RightPaneTab::Issues => "Filter issues…",
+            RightPaneTab::Notes => "",
+        };
 
         div()
             .w(px(self.right_pane_width))
@@ -55,7 +61,7 @@ impl ArborWindow {
                                     active_input_display(
                                         theme,
                                         "",
-                                        "Filter files…",
+                                        search_placeholder,
                                         theme.text_disabled,
                                         self.right_pane_search_cursor,
                                         28,
@@ -64,7 +70,7 @@ impl ArborWindow {
                                     active_input_display(
                                         theme,
                                         &search_text,
-                                        "Filter files…",
+                                        search_placeholder,
                                         theme.text_primary,
                                         self.right_pane_search_cursor,
                                         28,
@@ -73,7 +79,7 @@ impl ArborWindow {
                             } else if search_text.is_empty() {
                                 div()
                                     .text_color(rgb(theme.text_disabled))
-                                    .child("Filter files…")
+                                    .child(search_placeholder)
                                     .into_any_element()
                             } else {
                                 div()
@@ -142,8 +148,234 @@ impl ArborWindow {
             .border_b_1()
             .border_color(rgb(theme.border))
             .child(tab_button("Changes", RightPaneTab::Changes))
+            .child(tab_button("Issues", RightPaneTab::Issues))
             .child(tab_button("Files", RightPaneTab::FileTree))
             .child(tab_button("Notes", RightPaneTab::Notes))
+    }
+
+    fn render_issues_content(&mut self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let search_lower = self.right_pane_search.to_ascii_lowercase();
+        let filtered_issues: Vec<_> = self
+            .issues
+            .iter()
+            .filter(|issue| {
+                search_lower.is_empty()
+                    || issue.display_id.to_ascii_lowercase().contains(&search_lower)
+                    || issue.title.to_ascii_lowercase().contains(&search_lower)
+                    || issue.state.to_ascii_lowercase().contains(&search_lower)
+            })
+            .cloned()
+            .collect();
+        let source_label = self
+            .issue_source
+            .as_ref()
+            .map(|source| {
+                source
+                    .url
+                    .as_deref()
+                    .map(|url| format!("{} · {} · {url}", source.provider, source.label))
+                    .unwrap_or_else(|| {
+                        format!("{} · {} · {}", source.provider, source.label, source.repository)
+                    })
+            })
+            .unwrap_or_else(|| "Selected repository".to_owned());
+        let mut issues_body = div()
+            .id("issues-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .scrollbar_width(px(10.))
+            .flex()
+            .flex_col()
+            .p_2()
+            .gap_2();
+
+        if let Some(error) = self.issues_error.clone() {
+            issues_body = issues_body.child(
+                div()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(0xa44949))
+                    .bg(rgb(0x4d2a2a))
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0xffd7d7))
+                    .child(error),
+            );
+        }
+
+        if let Some(notice) = self.issues_notice.clone() {
+            issues_body = issues_body.child(
+                div()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.panel_bg))
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme.text_muted))
+                    .child(notice),
+            );
+        }
+
+        if self.issues_loading && filtered_issues.is_empty() {
+            issues_body = issues_body.child(
+                div()
+                    .py_4()
+                    .text_center()
+                    .text_sm()
+                    .text_color(rgb(theme.text_muted))
+                    .child("Loading issues…"),
+            );
+        } else if self.issues_error.is_none() && filtered_issues.is_empty() {
+            issues_body = issues_body.child(
+                div()
+                    .py_4()
+                    .text_center()
+                    .text_sm()
+                    .text_color(rgb(theme.text_muted))
+                    .child("No issues found for this repository."),
+            );
+        }
+
+        for (row_id, issue) in filtered_issues.into_iter().enumerate() {
+            let issue_context = issue.clone();
+            let updated_at = issue.updated_at.clone().unwrap_or_else(|| "-".to_owned());
+
+            issues_body = issues_body.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("issue-row-{row_id}-{}", issue.id).into(),
+                    ))
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.panel_bg))
+                    .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                    .px_2()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_issue_create_modal(issue_context.clone(), cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family(FONT_MONO)
+                                    .text_color(rgb(theme.accent))
+                                    .child(issue.display_id.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family(FONT_MONO)
+                                    .text_color(rgb(theme.text_muted))
+                                    .child(issue.state.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme.text_primary))
+                            .child(issue.title),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child(issue.suggested_worktree_name),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_disabled))
+                                    .child(updated_at),
+                            ),
+                    ),
+            );
+        }
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(32.))
+                    .px_2()
+                    .gap_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(theme.border))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.text_primary))
+                                    .child("Issues"),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child(source_label),
+                            ),
+                    )
+                    .child(
+                        action_button(
+                            theme,
+                            "issues-refresh",
+                            if self.issues_loading {
+                                "Loading…"
+                            } else {
+                                "Refresh"
+                            },
+                            ActionButtonStyle::Secondary,
+                            !self.issues_loading,
+                        )
+                        .when(!self.issues_loading, |this| {
+                            this.on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_issues(cx);
+                            }))
+                        }),
+                    ),
+            )
+            .child(issues_body)
     }
 
     fn render_changes_content(&mut self, cx: &mut Context<Self>) -> Div {

@@ -1,5 +1,23 @@
-import type { Repository, Worktree, TerminalSession, ChangedFile, ProcessInfo, AgentSession, AgentActivityWsEvent } from "./types";
-import { fetchRepositories, fetchWorktrees, fetchTerminals, fetchChangedFiles, fetchProcesses } from "./api";
+import type {
+  Repository,
+  Worktree,
+  TerminalSession,
+  ChangedFile,
+  ProcessInfo,
+  AgentSession,
+  AgentActivityWsEvent,
+  Issue,
+  IssueSource,
+  RightPanelTab,
+} from "./types";
+import {
+  fetchRepositories,
+  fetchWorktrees,
+  fetchTerminals,
+  fetchChangedFiles,
+  fetchProcesses,
+  fetchIssues,
+} from "./api";
 
 export type AppState = {
   repositories: Repository[];
@@ -8,6 +26,13 @@ export type AppState = {
   changedFiles: ChangedFile[];
   processes: ProcessInfo[];
   agentSessions: AgentSession[];
+  issues: Issue[];
+  issueSource: IssueSource | null;
+  issuesNotice: string | null;
+  issuesLoading: boolean;
+  issuesError: string | null;
+  issuesRepoRoot: string | null;
+  rightPanelTab: RightPanelTab;
 
   selectedRepoRoot: string | null;
   selectedWorktreePath: string | null;
@@ -25,6 +50,13 @@ export function createInitialState(): AppState {
     changedFiles: [],
     processes: [],
     agentSessions: [],
+    issues: [],
+    issueSource: null,
+    issuesNotice: null,
+    issuesLoading: false,
+    issuesError: null,
+    issuesRepoRoot: null,
+    rightPanelTab: "changes",
     selectedRepoRoot: null,
     selectedWorktreePath: null,
     activeSessionId: null,
@@ -98,6 +130,13 @@ export async function refresh(): Promise<void> {
       }
     }
 
+    if (selectedWorktreePath !== null) {
+      const selectedWorktree = worktrees.find((w) => w.path === selectedWorktreePath);
+      if (selectedWorktree !== undefined) {
+        selectedRepoRoot = selectedWorktree.repo_root;
+      }
+    }
+
     let activeSessionId =
       state.activeSessionId !== null &&
       sessions.some((s) => s.session_id === state.activeSessionId)
@@ -125,6 +164,17 @@ export async function refresh(): Promise<void> {
       }
     }
 
+    const nextIssuesRepoRoot = selectedIssueRepoRootForSelection(
+      worktrees,
+      selectedRepoRoot,
+      selectedWorktreePath,
+    );
+    const issueRepoChanged = nextIssuesRepoRoot !== state.issuesRepoRoot;
+    const shouldRefreshIssues =
+      state.rightPanelTab === "issues" &&
+      nextIssuesRepoRoot !== null &&
+      (issueRepoChanged || state.issueSource === null);
+
     updateState({
       repositories,
       worktrees,
@@ -133,6 +183,16 @@ export async function refresh(): Promise<void> {
       selectedRepoRoot,
       selectedWorktreePath,
       activeSessionId,
+      ...(issueRepoChanged
+        ? {
+            issues: [],
+            issueSource: null,
+            issuesNotice: null,
+            issuesError: null,
+            issuesLoading: false,
+            issuesRepoRoot: nextIssuesRepoRoot,
+          }
+        : {}),
       loading: false,
     });
 
@@ -141,6 +201,10 @@ export async function refresh(): Promise<void> {
       refreshChangedFiles(selectedWorktreePath);
     } else {
       updateState({ changedFiles: [] });
+    }
+
+    if (shouldRefreshIssues) {
+      refreshIssues(nextIssuesRepoRoot, true);
     }
   } catch (error) {
     updateState({
@@ -166,6 +230,16 @@ export function refreshChangedFiles(worktreePath: string): void {
 
 export function selectWorktree(path: string | null): void {
   const newPath = state.selectedWorktreePath === path ? null : path;
+  const selectedWorktree = newPath !== null
+    ? state.worktrees.find((worktree) => worktree.path === newPath) ?? null
+    : null;
+  const selectedRepoRoot = selectedWorktree?.repo_root ?? state.selectedRepoRoot;
+  const nextIssuesRepoRoot = selectedIssueRepoRootForSelection(
+    state.worktrees,
+    selectedRepoRoot,
+    newPath,
+  );
+  const issueRepoChanged = nextIssuesRepoRoot !== state.issuesRepoRoot;
 
   // Auto-select a terminal for this worktree
   let activeSessionId = state.activeSessionId;
@@ -176,16 +250,115 @@ export function selectWorktree(path: string | null): void {
     const running = wtSessions.find((s) => s.state === "running");
     const first = running ?? wtSessions[0];
     activeSessionId = first?.session_id ?? null;
+  } else {
+    activeSessionId = null;
   }
 
-  updateState({ selectedWorktreePath: newPath, changedFiles: [], activeSessionId });
+  updateState({
+    selectedRepoRoot,
+    selectedWorktreePath: newPath,
+    changedFiles: [],
+    activeSessionId,
+    ...(issueRepoChanged
+      ? {
+          issues: [],
+          issueSource: null,
+          issuesNotice: null,
+          issuesError: null,
+          issuesLoading: false,
+          issuesRepoRoot: nextIssuesRepoRoot,
+        }
+      : {}),
+  });
   if (newPath !== null) {
     refreshChangedFiles(newPath);
+  }
+  if (
+    state.rightPanelTab === "issues" &&
+    nextIssuesRepoRoot !== null &&
+    (issueRepoChanged || state.issueSource === null)
+  ) {
+    refreshIssues(nextIssuesRepoRoot, true);
   }
 }
 
 export function setActiveSession(sessionId: string | null): void {
   updateState({ activeSessionId: sessionId });
+}
+
+export function setRightPanelTab(tab: RightPanelTab): void {
+  if (state.rightPanelTab === tab) return;
+  updateState({ rightPanelTab: tab });
+  if (tab === "issues") {
+    const repoRoot = selectedIssueRepoRoot();
+    if (repoRoot !== null) {
+      refreshIssues(repoRoot, state.issuesRepoRoot !== repoRoot || state.issueSource === null);
+    }
+  }
+}
+
+export function selectedIssueRepoRoot(): string | null {
+  return selectedIssueRepoRootForSelection(
+    state.worktrees,
+    state.selectedRepoRoot,
+    state.selectedWorktreePath,
+  );
+}
+
+export function refreshIssues(
+  repoRoot: string | null = selectedIssueRepoRoot(),
+  force = false,
+): void {
+  if (repoRoot === null) {
+    updateState({
+      issues: [],
+      issueSource: null,
+      issuesNotice: null,
+      issuesError: null,
+      issuesLoading: false,
+      issuesRepoRoot: null,
+    });
+    return;
+  }
+
+  if (!force && state.issuesLoading && state.issuesRepoRoot === repoRoot) {
+    return;
+  }
+
+  updateState({
+    issuesLoading: true,
+    issuesError: null,
+    issuesNotice: null,
+    issuesRepoRoot: repoRoot,
+  });
+
+  fetchIssues(repoRoot)
+    .then((response) => {
+      if (selectedIssueRepoRoot() !== repoRoot) {
+        return;
+      }
+      updateState({
+        issues: response.issues,
+        issueSource: response.source,
+        issuesNotice: response.notice,
+        issuesError: null,
+        issuesLoading: false,
+        issuesRepoRoot: repoRoot,
+      });
+    })
+    .catch((error) => {
+      if (selectedIssueRepoRoot() !== repoRoot) {
+        return;
+      }
+      updateState({
+        issues: [],
+        issueSource: null,
+        issuesNotice: null,
+        issuesError: error instanceof Error ? error.message : "failed to load issues",
+        issuesLoading: false,
+        issuesRepoRoot: repoRoot,
+      });
+    });
 }
 
 export function filteredSessions(): TerminalSession[] {
@@ -195,6 +368,20 @@ export function filteredSessions(): TerminalSession[] {
   return state.sessions.filter(
     (s) => s.workspace_id === state.selectedWorktreePath || s.cwd === state.selectedWorktreePath,
   );
+}
+
+function selectedIssueRepoRootForSelection(
+  worktrees: Worktree[],
+  selectedRepoRoot: string | null,
+  selectedWorktreePath: string | null,
+): string | null {
+  if (selectedWorktreePath !== null) {
+    const worktree = worktrees.find((candidate) => candidate.path === selectedWorktreePath);
+    if (worktree !== undefined) {
+      return worktree.repo_root;
+    }
+  }
+  return selectedRepoRoot;
 }
 
 // ── Agent activity WebSocket ─────────────────────────────────────────

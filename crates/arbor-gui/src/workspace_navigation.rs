@@ -1,4 +1,138 @@
 impl ArborWindow {
+    fn issue_target_for_current_selection(&self) -> Option<IssueTarget> {
+        if let Some(active_remote_worktree) = self.active_remote_worktree.as_ref() {
+            return Some(IssueTarget {
+                daemon_target: ManagedDaemonTarget::Remote(active_remote_worktree.daemon_index),
+                repo_root: active_remote_worktree.repo_root.clone(),
+            });
+        }
+
+        if self.active_outpost_index.is_some() {
+            return None;
+        }
+
+        if let Some(active_worktree) = self.active_worktree() {
+            return Some(IssueTarget {
+                daemon_target: ManagedDaemonTarget::Primary,
+                repo_root: active_worktree.repo_root.display().to_string(),
+            });
+        }
+
+        self.selected_repository().map(|repository| IssueTarget {
+            daemon_target: ManagedDaemonTarget::Primary,
+            repo_root: repository.root.display().to_string(),
+        })
+    }
+
+    fn daemon_client_for_target(
+        &self,
+        target: &IssueTarget,
+    ) -> Option<terminal_daemon_http::SharedTerminalDaemonClient> {
+        match target.daemon_target {
+            ManagedDaemonTarget::Primary => self.terminal_daemon.clone(),
+            ManagedDaemonTarget::Remote(index) => self
+                .remote_daemon_states
+                .get(&index)
+                .map(|state| state.client.clone()),
+        }
+    }
+
+    fn sync_issue_target(&mut self, cx: &mut Context<Self>) {
+        let next_target = self.issue_target_for_current_selection();
+        if self.issues_target == next_target {
+            return;
+        }
+
+        self.issues_target = next_target;
+        self.issues.clear();
+        self.issue_source = None;
+        self.issues_error = None;
+        self.issues_loading = false;
+        self.issues_notice = if self.active_outpost_index.is_some() {
+            Some(
+                "Issues are unavailable for SSH outposts. Select a daemon-backed repository instead."
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+
+        if self.right_pane_tab == RightPaneTab::Issues {
+            self.refresh_issues(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn refresh_issues(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.issue_target_for_current_selection() else {
+            self.issues.clear();
+            self.issue_source = None;
+            self.issues_error = None;
+            self.issues_loading = false;
+            self.issues_target = None;
+            self.issues_notice = if self.active_outpost_index.is_some() {
+                Some(
+                    "Issues are unavailable for SSH outposts. Select a daemon-backed repository instead."
+                        .to_owned(),
+                )
+            } else {
+                Some("Select a repository to load issues.".to_owned())
+            };
+            cx.notify();
+            return;
+        };
+
+        let Some(client) = self.daemon_client_for_target(&target) else {
+            self.issues.clear();
+            self.issue_source = None;
+            self.issues_error = Some("No daemon connection is available for this repository.".to_owned());
+            self.issues_loading = false;
+            self.issues_notice = None;
+            self.issues_target = Some(target);
+            cx.notify();
+            return;
+        };
+
+        self.issues_loading = true;
+        self.issues_error = None;
+        self.issues_notice = None;
+        self.issues_target = Some(target.clone());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let repo_root = target.repo_root.clone();
+            let response = cx
+                .background_spawn(async move { client.list_issues(&repo_root) })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                if this.issue_target_for_current_selection().as_ref() != Some(&target) {
+                    return;
+                }
+
+                this.issues_loading = false;
+                this.issues_target = Some(target.clone());
+                match response {
+                    Ok(response) => {
+                        this.issues = response.issues;
+                        this.issue_source = response.source;
+                        this.issues_notice = response.notice;
+                        this.issues_error = None;
+                    },
+                    Err(error) => {
+                        this.issues.clear();
+                        this.issue_source = None;
+                        this.issues_notice = None;
+                        this.issues_error = Some(format!("failed to load issues: {error}"));
+                    },
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn selected_worktree_path(&self) -> Option<&Path> {
         if let Some(ref arw) = self.active_remote_worktree {
             return Some(arw.worktree_path.as_path());
@@ -555,6 +689,7 @@ impl ArborWindow {
         }
 
         self.active_repository_index = Some(index);
+        self.active_remote_worktree = None;
         self.repo_root = repository.root.clone();
         self.github_repo_slug = repository.github_repo_slug.clone();
         self.worktree_stats_loading = false;
@@ -568,6 +703,7 @@ impl ArborWindow {
         self.refresh_worktrees(cx);
         self.refresh_repo_config_if_changed(cx);
         self.sync_selected_worktree_notes();
+        self.sync_issue_target(cx);
         self.focus_terminal_on_next_render = true;
         cx.notify();
     }
@@ -974,6 +1110,7 @@ impl ArborWindow {
         self.refresh_repo_config_if_changed(cx);
         let _ = self.reload_changed_files();
         self.sync_selected_worktree_notes();
+        self.sync_issue_target(cx);
         self.expanded_dirs.clear();
         self.selected_file_tree_entry = None;
         self.file_tree_entries.clear();
@@ -1100,9 +1237,11 @@ impl ArborWindow {
         self.close_top_bar_worktree_quick_actions();
         self.active_outpost_index = Some(index);
         self.active_worktree_index = None;
+        self.active_remote_worktree = None;
         self.changed_files.clear();
         self.selected_changed_file = None;
         self.sync_selected_worktree_notes();
+        self.sync_issue_target(cx);
         self.refresh_remote_changed_files(cx);
         cx.notify();
     }
@@ -1387,6 +1526,9 @@ impl ArborWindow {
         self.right_pane_search.clear();
         self.right_pane_search_cursor = 0;
         self.right_pane_search_active = false;
+        if tab == RightPaneTab::Issues {
+            self.refresh_issues(cx);
+        }
         if tab == RightPaneTab::FileTree && self.file_tree_entries.is_empty() {
             self.rebuild_file_tree();
         }

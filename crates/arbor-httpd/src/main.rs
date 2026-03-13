@@ -1,5 +1,7 @@
 mod auth;
 mod github_service;
+mod issue_provider;
+mod managed_worktree;
 #[cfg(feature = "mdns")]
 mod mdns;
 mod process_manager;
@@ -32,7 +34,10 @@ fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/repositories", get(list_repositories))
+        .route("/issues", get(list_repository_issues))
         .route("/worktrees", get(list_worktrees).post(create_worktree))
+        .route("/worktrees/managed/preview", post(preview_managed_worktree))
+        .route("/worktrees/managed", post(create_managed_worktree))
         .route("/worktrees/delete", post(delete_worktree))
         .route("/worktrees/changes", get(list_worktree_changes))
         .route("/worktrees/commit", post(commit_worktree))
@@ -200,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         symphony,
         task_scheduler: Arc::new(Mutex::new(task_scheduler)),
         github_service: github_service::default_github_pr_service(),
+        issue_service: Arc::new(issue_provider::RepositoryIssueService::default()),
         agent_sessions: Arc::new(Mutex::new(HashMap::new())),
         agent_broadcast,
         log_broadcast,
@@ -708,6 +714,7 @@ mod tests {
             #[cfg(feature = "symphony")]
             symphony: None,
             github_service: github_service::default_github_pr_service(),
+            issue_service: Arc::new(issue_provider::RepositoryIssueService::default()),
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
             agent_broadcast,
             log_broadcast,

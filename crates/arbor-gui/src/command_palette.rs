@@ -29,6 +29,12 @@ impl ArborWindow {
                 action: CommandPaletteAction::OpenReviewPullRequest,
             },
             CommandPaletteItem {
+                title: "Issues".to_owned(),
+                subtitle: "Show issues for the selected repository".to_owned(),
+                search_text: "issues github gitlab linear tickets bugs".to_owned(),
+                action: CommandPaletteAction::OpenIssues,
+            },
+            CommandPaletteItem {
                 title: "Refresh Worktrees".to_owned(),
                 subtitle: "Reload repositories and worktrees".to_owned(),
                 search_text: "refresh worktrees reload repos".to_owned(),
@@ -230,6 +236,7 @@ impl ArborWindow {
                 usize::from(self.active_preset_tab != Some(*kind)) + 1
             },
             CommandPaletteAction::OpenCreateWorktree
+            | CommandPaletteAction::OpenIssues
             | CommandPaletteAction::OpenReviewPullRequest
             | CommandPaletteAction::RefreshWorktrees
             | CommandPaletteAction::ToggleCompactSidebar
@@ -264,6 +271,9 @@ impl ArborWindow {
             CommandPaletteAction::OpenCreateWorktree => {
                 let repo_index = self.active_repository_index.unwrap_or(0);
                 self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
+            },
+            CommandPaletteAction::OpenIssues => {
+                self.set_right_pane_tab(RightPaneTab::Issues, cx);
             },
             CommandPaletteAction::OpenReviewPullRequest => {
                 let repo_index = self.active_repository_index.unwrap_or(0);
@@ -586,6 +596,9 @@ fn command_palette_icon(action: &CommandPaletteAction, theme: ThemePalette) -> A
     match action {
         CommandPaletteAction::OpenCreateWorktree => {
             command_palette_glyph_icon("\u{f055}", 0x98c379, theme)
+        },
+        CommandPaletteAction::OpenIssues => {
+            command_palette_glyph_icon("\u{f145}", 0x61afef, theme)
         },
         CommandPaletteAction::OpenReviewPullRequest => {
             command_palette_glyph_icon("\u{f0ea}", 0xc678dd, theme)

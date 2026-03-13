@@ -1,6 +1,7 @@
 use {
     crate::{
         github_service::GitHubPrService,
+        managed_worktree::preview_managed_worktree as build_managed_worktree_preview,
         process_manager::ProcessEvent,
         repository_store, task_scheduler,
         terminal_daemon::{LocalTerminalDaemonError, SessionEvent},
@@ -21,10 +22,12 @@ use {
         worktree_scripts::{WorktreeScriptContext, WorktreeScriptPhase, run_worktree_scripts},
     },
     arbor_daemon_client::{
-        AgentSessionDto, ChangedFileDto, CommitWorktreeRequest, CreateTerminalRequest,
-        CreateTerminalResponse, CreateWorktreeRequest, DeleteWorktreeRequest, GitActionResponse,
-        HealthResponse, PushWorktreeRequest, RepositoryDto, TerminalResizeRequest,
-        TerminalSignalRequest, WorktreeDto, WorktreeMutationResponse,
+        AgentSessionDto, ChangedFileDto, CommitWorktreeRequest, CreateManagedWorktreeRequest,
+        CreateTerminalRequest, CreateTerminalResponse, CreateWorktreeRequest,
+        DeleteWorktreeRequest, GitActionResponse, HealthResponse, IssueListResponse,
+        ManagedWorktreePreviewRequest, ManagedWorktreePreviewResponse, PushWorktreeRequest,
+        RepositoryDto, TerminalResizeRequest, TerminalSignalRequest, WorktreeDto,
+        WorktreeMutationResponse,
     },
     axum::{
         Json,
@@ -181,6 +184,20 @@ pub(crate) async fn list_repositories(
     Ok(Json(repositories))
 }
 
+pub(crate) async fn list_repository_issues(
+    State(state): State<AppState>,
+    Query(query): Query<IssuesQuery>,
+) -> ApiResult<IssueListResponse> {
+    let repo_root = PathBuf::from(query.repo_root);
+    let issue_service = state.issue_service.clone();
+    let issues =
+        tokio::task::spawn_blocking(move || issue_service.list_repository_issues(&repo_root))
+            .await
+            .map_err(|error| internal_error(format!("failed to join issue fetch task: {error}")))?
+            .map_err(internal_error)?;
+    Ok(Json(issues))
+}
+
 pub(crate) async fn list_worktrees(
     State(state): State<AppState>,
     Query(query): Query<WorktreeQuery>,
@@ -305,6 +322,56 @@ pub(crate) async fn create_worktree(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
 
+    create_worktree_at(
+        repo_root,
+        worktree_path,
+        branch,
+        request.detach,
+        request.force,
+    )
+}
+
+pub(crate) async fn preview_managed_worktree(
+    Json(request): Json<ManagedWorktreePreviewRequest>,
+) -> ApiResult<ManagedWorktreePreviewResponse> {
+    let repo_root = PathBuf::from(&request.repo_root);
+    let repo_root = worktree::repo_root(&repo_root)
+        .map_err(|error| internal_error(format!("failed to resolve repository root: {error}")))?;
+    let preview = build_managed_worktree_preview(&repo_root, &request.worktree_name)
+        .map_err(internal_error)?;
+
+    Ok(Json(ManagedWorktreePreviewResponse {
+        sanitized_worktree_name: preview.sanitized_worktree_name,
+        branch: preview.branch_name,
+        path: preview.worktree_path.display().to_string(),
+    }))
+}
+
+pub(crate) async fn create_managed_worktree(
+    Json(request): Json<CreateManagedWorktreeRequest>,
+) -> ApiResult<WorktreeMutationResponse> {
+    let repo_root = PathBuf::from(&request.repo_root);
+    let repo_root = worktree::repo_root(&repo_root)
+        .map_err(|error| internal_error(format!("failed to resolve repository root: {error}")))?;
+    let preview = build_managed_worktree_preview(&repo_root, &request.worktree_name)
+        .map_err(internal_error)?;
+
+    create_worktree_at(
+        repo_root,
+        preview.worktree_path,
+        Some(preview.branch_name),
+        Some(false),
+        Some(false),
+    )
+}
+
+fn create_worktree_at(
+    repo_root: PathBuf,
+    worktree_path: PathBuf,
+    branch: Option<String>,
+    detach: Option<bool>,
+    force: Option<bool>,
+) -> ApiResult<WorktreeMutationResponse> {
     if paths_equivalent(&repo_root, &worktree_path) {
         return Err(internal_error(
             "refusing to create a worktree over the primary checkout",
@@ -330,8 +397,8 @@ pub(crate) async fn create_worktree(
 
     worktree::add(&repo_root, &worktree_path, worktree::AddWorktreeOptions {
         branch: branch.as_deref(),
-        detach: request.detach.unwrap_or(false),
-        force: request.force.unwrap_or(false),
+        detach: detach.unwrap_or(false),
+        force: force.unwrap_or(false),
     })
     .map_err(|error| internal_error(format!("failed to create worktree: {error}")))?;
 

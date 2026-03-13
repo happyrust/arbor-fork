@@ -34,11 +34,153 @@ impl ArborWindow {
             outpost_name: String::new(),
             outpost_name_cursor: 0,
             outpost_active_field: CreateOutpostField::CloneUrl,
+            daemon_managed_target: None,
+            managed_preview: None,
+            managed_preview_loading: false,
+            managed_preview_error: None,
+            managed_preview_generation: 0,
+            issue_context: None,
             is_creating: false,
             creating_status: None,
             error: None,
         });
         cx.notify();
+    }
+
+    fn open_issue_create_modal(
+        &mut self,
+        issue: terminal_daemon_http::IssueDto,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.issue_target_for_current_selection() else {
+            self.notice = Some("No daemon-backed repository is selected for this issue.".to_owned());
+            cx.notify();
+            return;
+        };
+
+        let repository_path = target.repo_root.clone();
+        let worktree_name = issue.suggested_worktree_name.clone();
+        let clone_url = self
+            .selected_repository()
+            .and_then(|repository| repository.github_repo_slug.as_ref())
+            .map(|slug| format!("git@github.com:{slug}.git"))
+            .unwrap_or_default();
+        let source_label = self
+            .issue_source
+            .as_ref()
+            .map(|source| source.label.clone())
+            .unwrap_or_else(|| "Issue".to_owned());
+
+        self.create_modal = Some(CreateModal {
+            tab: CreateModalTab::LocalWorktree,
+            repository_path_cursor: char_count(&repository_path),
+            repository_path,
+            worktree_name_cursor: char_count(&worktree_name),
+            worktree_name,
+            checkout_kind: CheckoutKind::LinkedWorktree,
+            worktree_active_field: CreateWorktreeField::WorktreeName,
+            pr_reference: String::new(),
+            pr_reference_cursor: 0,
+            review_active_field: CreateReviewPrField::PullRequestReference,
+            host_index: 0,
+            host_dropdown_open: false,
+            clone_url_cursor: char_count(&clone_url),
+            clone_url,
+            outpost_name: String::new(),
+            outpost_name_cursor: 0,
+            outpost_active_field: CreateOutpostField::CloneUrl,
+            daemon_managed_target: Some(target.daemon_target),
+            managed_preview: None,
+            managed_preview_loading: false,
+            managed_preview_error: None,
+            managed_preview_generation: 0,
+            issue_context: Some(CreateModalIssueContext {
+                source_label,
+                display_id: issue.display_id,
+                title: issue.title,
+                url: issue.url,
+            }),
+            is_creating: false,
+            creating_status: None,
+            error: None,
+        });
+        self.refresh_create_modal_managed_preview(cx);
+        cx.notify();
+    }
+
+    fn refresh_create_modal_managed_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.create_modal.as_mut() else {
+            return;
+        };
+        let Some(target) = modal.daemon_managed_target else {
+            return;
+        };
+
+        let repository_path = modal.repository_path.trim().to_owned();
+        let worktree_name = modal.worktree_name.trim().to_owned();
+        modal.managed_preview_generation = modal.managed_preview_generation.wrapping_add(1);
+        let generation = modal.managed_preview_generation;
+
+        if repository_path.is_empty() || worktree_name.is_empty() {
+            modal.managed_preview = None;
+            modal.managed_preview_loading = false;
+            modal.managed_preview_error = None;
+            cx.notify();
+            return;
+        }
+
+        let client = match target {
+            ManagedDaemonTarget::Primary => self.terminal_daemon.clone(),
+            ManagedDaemonTarget::Remote(index) => self
+                .remote_daemon_states
+                .get(&index)
+                .map(|state| state.client.clone()),
+        };
+        let Some(client) = client else {
+            modal.managed_preview = None;
+            modal.managed_preview_loading = false;
+            modal.managed_preview_error =
+                Some("No daemon connection is available for this issue.".to_owned());
+            cx.notify();
+            return;
+        };
+
+        modal.managed_preview = None;
+        modal.managed_preview_loading = true;
+        modal.managed_preview_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let preview = cx
+                .background_spawn(async move {
+                    client.preview_managed_worktree(&repository_path, &worktree_name)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let Some(modal) = this.create_modal.as_mut() else {
+                    return;
+                };
+                if modal.managed_preview_generation != generation {
+                    return;
+                }
+
+                modal.managed_preview_loading = false;
+                match preview {
+                    Ok(preview) => {
+                        modal.managed_preview = Some(preview);
+                        modal.managed_preview_error = None;
+                    },
+                    Err(error) => {
+                        modal.managed_preview = None;
+                        modal.managed_preview_error =
+                            Some(format!("failed to resolve worktree preview: {error}"));
+                    },
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn update_create_review_pr_modal_input(
@@ -318,6 +460,7 @@ impl ArborWindow {
         input: ModalInputEvent,
         cx: &mut Context<Self>,
     ) {
+        let mut refresh_managed_preview = false;
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -351,6 +494,7 @@ impl ArborWindow {
                         &mut modal.repository_path_cursor,
                         &action,
                     );
+                    refresh_managed_preview = modal.daemon_managed_target.is_some();
                 },
                 CreateWorktreeField::WorktreeName => {
                     apply_text_edit_action(
@@ -358,6 +502,7 @@ impl ArborWindow {
                         &mut modal.worktree_name_cursor,
                         &action,
                     );
+                    refresh_managed_preview = modal.daemon_managed_target.is_some();
                 },
             },
             ModalInputEvent::ClearError => {
@@ -366,6 +511,9 @@ impl ArborWindow {
         }
 
         cx.notify();
+        if refresh_managed_preview {
+            self.refresh_create_modal_managed_preview(cx);
+        }
     }
 
     fn submit_create_worktree_modal(&mut self, cx: &mut Context<Self>) {
@@ -381,6 +529,7 @@ impl ArborWindow {
         let repository_input = modal.repository_path.trim().to_owned();
         let worktree_input = modal.worktree_name.trim().to_owned();
         let checkout_kind = modal.checkout_kind;
+        let daemon_managed_target = modal.daemon_managed_target;
         if repository_input.is_empty() {
             modal.error = Some("Repository path is required.".to_owned());
             cx.notify();
@@ -394,7 +543,106 @@ impl ArborWindow {
         }
 
         modal.is_creating = true;
+        modal.creating_status = daemon_managed_target.map(|_| "Creating managed worktree…".to_owned());
         cx.notify();
+
+        if let Some(target) = daemon_managed_target {
+            let client = match target {
+                ManagedDaemonTarget::Primary => self.terminal_daemon.clone(),
+                ManagedDaemonTarget::Remote(index) => self
+                    .remote_daemon_states
+                    .get(&index)
+                    .map(|state| state.client.clone()),
+            };
+            let Some(client) = client else {
+                if let Some(modal) = self.create_modal.as_mut() {
+                    modal.is_creating = false;
+                    modal.creating_status = None;
+                    modal.error =
+                        Some("No daemon connection is available for this issue.".to_owned());
+                }
+                cx.notify();
+                return;
+            };
+
+            cx.spawn(async move |this, cx| {
+                let creation = cx
+                    .background_spawn(async move {
+                        client.create_managed_worktree(&repository_input, &worktree_input)
+                    })
+                    .await;
+
+                let _ = this.update(cx, |this, cx| {
+                    match creation {
+                        Ok(created) => {
+                            this.create_modal = None;
+                            this.notice = Some(created.message.clone());
+
+                            match target {
+                                ManagedDaemonTarget::Primary => {
+                                    let worktree_path = PathBuf::from(&created.path);
+                                    this.refresh_worktrees(cx);
+                                    if let Some(index) = this
+                                        .worktrees
+                                        .iter()
+                                        .position(|worktree| worktree.path == worktree_path)
+                                    {
+                                        this.active_worktree_index = Some(index);
+                                        let _ = this.reload_changed_files();
+                                        if this.ensure_selected_worktree_terminal() {
+                                            this.sync_daemon_session_store(cx);
+                                        }
+                                        this.terminal_scroll_handle.scroll_to_bottom();
+                                        this.focus_terminal_on_next_render = true;
+                                    }
+                                },
+                                ManagedDaemonTarget::Remote(index) => {
+                                    if let Some(state) = this.remote_daemon_states.get_mut(&index) {
+                                        let branch = created.branch.clone().unwrap_or_default();
+                                        if !state.worktrees.iter().any(|worktree| worktree.path == created.path)
+                                        {
+                                            state.worktrees.push(
+                                                terminal_daemon_http::RemoteWorktreeDto {
+                                                    repo_root: created.repo_root.clone(),
+                                                    path: created.path.clone(),
+                                                    branch,
+                                                    is_primary_checkout: false,
+                                                    last_activity_unix_ms: None,
+                                                    diff_additions: None,
+                                                    diff_deletions: None,
+                                                    pr_number: None,
+                                                    pr_url: None,
+                                                },
+                                            );
+                                        }
+                                    }
+
+                                    this.activate_remote_worktree(
+                                        index,
+                                        created.path,
+                                        created.repo_root,
+                                        cx,
+                                    );
+                                },
+                            }
+                        },
+                        Err(error) => {
+                            tracing::error!("daemon worktree creation failed: {error}");
+                            if let Some(modal) = this.create_modal.as_mut() {
+                                modal.is_creating = false;
+                                modal.creating_status = None;
+                                modal.error = Some(format!("{error}"));
+                            } else {
+                                this.notice = Some(format!("{error}"));
+                            }
+                        },
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
 
         cx.spawn(async move |this, cx| {
             let creation = cx
@@ -936,22 +1184,34 @@ impl ArborWindow {
         let is_worktree_tab = modal.tab == CreateModalTab::LocalWorktree;
         let is_review_pr_tab = modal.tab == CreateModalTab::ReviewPullRequest;
         let is_outpost_tab = modal.tab == CreateModalTab::RemoteOutpost;
+        let daemon_managed_worktree = modal.daemon_managed_target.is_some();
+        let issue_context = modal.issue_context.clone();
 
         // Worktree tab data
-        let branch_name = self.derive_branch_name_for_repo(
-            Path::new(modal.repository_path.trim()),
-            &modal.worktree_name,
-        );
-        let target_path_preview =
+        let branch_name = if let Some(preview) = modal.managed_preview.as_ref() {
+            preview.branch.clone()
+        } else if daemon_managed_worktree && modal.managed_preview_loading {
+            "Resolving preview…".to_owned()
+        } else {
+            self.derive_branch_name_for_repo(Path::new(modal.repository_path.trim()), &modal.worktree_name)
+        };
+        let target_path_preview = if let Some(preview) = modal.managed_preview.as_ref() {
+            preview.path.clone()
+        } else if daemon_managed_worktree && modal.managed_preview_loading {
+            "Resolving preview…".to_owned()
+        } else {
             preview_managed_worktree_path(modal.repository_path.trim(), modal.worktree_name.trim())
-                .unwrap_or_else(|_| "-".to_owned());
+                .unwrap_or_else(|_| "-".to_owned())
+        };
         let checkout_kind = modal.checkout_kind;
         let is_discrete_clone = checkout_kind == CheckoutKind::DiscreteClone;
         let repository_active = modal.worktree_active_field == CreateWorktreeField::RepositoryPath;
         let worktree_active = modal.worktree_active_field == CreateWorktreeField::WorktreeName;
         let worktree_create_disabled = modal.is_creating
             || modal.repository_path.trim().is_empty()
-            || modal.worktree_name.trim().is_empty();
+            || modal.worktree_name.trim().is_empty()
+            || (daemon_managed_worktree
+                && (modal.managed_preview_loading || modal.managed_preview.is_none()));
 
         // Review PR tab data
         let review_repository_active =
@@ -1015,6 +1275,8 @@ impl ArborWindow {
         let creating_status = modal.creating_status.clone();
         let submit_label: String = if modal.is_creating {
             creating_status.as_deref().unwrap_or("Creating…").to_owned()
+        } else if daemon_managed_worktree && is_worktree_tab {
+            "Create Worktree".to_owned()
         } else if is_worktree_tab {
             checkout_kind.action_label().to_owned()
         } else if is_review_pr_tab {
@@ -1183,9 +1445,61 @@ impl ArborWindow {
                                 .flex_none()
                                 .text_xs()
                                 .text_color(rgb(theme.text_muted))
-                                .child("Target base: ~/.arbor/worktrees/<repo>/<worktree>/"),
+                                .child(if daemon_managed_worktree {
+                                    "Managed worktrees are created by the daemon under ~/.arbor/worktrees/<repo>/<worktree>/."
+                                } else {
+                                    "Target base: ~/.arbor/worktrees/<repo>/<worktree>/"
+                                }),
                         )
-                        .child(
+                        .when_some(issue_context.clone(), |this, issue| {
+                            this.child(
+                                div()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(theme.border))
+                                    .bg(rgb(theme.panel_bg))
+                                    .p_2()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_family(FONT_MONO)
+                                                    .text_color(rgb(theme.accent))
+                                                    .child(issue.display_id),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme.text_muted))
+                                                    .child(issue.source_label),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(theme.text_primary))
+                                            .child(issue.title),
+                                    )
+                                    .when_some(issue.url, |this, url| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .font_family(FONT_MONO)
+                                                .text_color(rgb(theme.text_muted))
+                                                .child(url),
+                                        )
+                                    }),
+                            )
+                        })
+                        .when(!daemon_managed_worktree, |this| this.child(
                             div()
                                 .flex_none()
                                 .id("create-discrete-clone-checkbox")
@@ -1268,7 +1582,7 @@ impl ArborWindow {
                                                 .child(checkout_kind.description()),
                                         ),
                                 ),
-                        )
+                        ))
                         .child(
                             modal_input_field(
                                 theme,
@@ -1351,6 +1665,20 @@ impl ArborWindow {
                                         .child(target_path_preview),
                                 ),
                         )
+                        .when_some(modal.managed_preview_error.clone(), |this, error| {
+                            this.child(
+                                div()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(0xa44949))
+                                    .bg(rgb(0x4d2a2a))
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(rgb(0xffd7d7))
+                                    .child(error),
+                            )
+                        })
                     })
                     // Review PR tab content
                     .when(is_review_pr_tab, |this| {

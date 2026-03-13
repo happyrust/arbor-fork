@@ -1,8 +1,31 @@
-import { test, expect } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+
+type ManagedWorktreeRequest = {
+  repo_root: string;
+  worktree_name: string;
+};
+
+function parseManagedWorktreeRequest(raw: unknown): ManagedWorktreeRequest {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error("managed worktree request body must be an object");
+  }
+
+  const repoRoot = raw["repo_root"];
+  const worktreeName = raw["worktree_name"];
+  if (typeof repoRoot !== "string" || typeof worktreeName !== "string") {
+    throw new Error("managed worktree request body is missing required fields");
+  }
+
+  return {
+    repo_root: repoRoot,
+    worktree_name: worktreeName,
+  };
+}
 
 test.describe("Arbor Web UI", () => {
   test.beforeEach(async ({ page }) => {
-    // Mock API responses so tests work without a running backend
+    let managedWorktreeCreateCount = 0;
+
     await page.route("**/api/v1/repositories", (route) =>
       route.fulfill({
         status: 200,
@@ -24,7 +47,7 @@ test.describe("Arbor Web UI", () => {
       }),
     );
 
-    await page.route("**/api/v1/worktrees**", (route) =>
+    await page.route("**/api/v1/worktrees", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -51,6 +74,19 @@ test.describe("Arbor Web UI", () => {
             pr_number: 365,
             pr_url: "https://github.com/penso/arbor/pull/365",
           },
+          ...(managedWorktreeCreateCount > 0
+            ? [{
+                repo_root: "/home/user/projects/arbor",
+                path: "/Users/penso/.arbor/worktrees/arbor/github-512-ship-httpd-issues",
+                branch: "codex/github-512-ship-httpd-issues",
+                is_primary_checkout: false,
+                last_activity_unix_ms: Date.now(),
+                diff_additions: 0,
+                diff_deletions: 0,
+                pr_number: null,
+                pr_url: null,
+              }]
+            : []),
           {
             repo_root: "/home/user/projects/moltis",
             path: "/home/user/projects/moltis",
@@ -119,6 +155,79 @@ test.describe("Arbor Web UI", () => {
       }),
     );
 
+    await page.route("**/api/v1/processes", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([]),
+      }),
+    );
+
+    await page.route("**/api/v1/issues**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          source: {
+            provider: "github",
+            label: "GitHub",
+            repository: "penso/arbor",
+            url: "https://github.com/penso/arbor/issues",
+          },
+          issues: [
+            {
+              id: "github:512",
+              display_id: "#512",
+              title: "Ship daemon-backed issue worktrees",
+              state: "open",
+              url: "https://github.com/penso/arbor/issues/512",
+              suggested_worktree_name: "github-512-ship-httpd-issues",
+              updated_at: "2026-03-13T10:00:00Z",
+            },
+            {
+              id: "github:513",
+              display_id: "#513",
+              title: "Teach the command palette about issues",
+              state: "open",
+              url: "https://github.com/penso/arbor/issues/513",
+              suggested_worktree_name: "github-513-command-palette-issues",
+              updated_at: "2026-03-13T08:30:00Z",
+            },
+          ],
+          notice: null,
+        }),
+      }),
+    );
+
+    await page.route("**/api/v1/worktrees/managed/preview", (route) => {
+      const body = parseManagedWorktreeRequest(route.request().postDataJSON());
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          sanitized_worktree_name: body.worktree_name,
+          branch: `codex/${body.worktree_name}`,
+          path: `/Users/penso/.arbor/worktrees/arbor/${body.worktree_name}`,
+        }),
+      });
+    });
+
+    await page.route("**/api/v1/worktrees/managed", (route) => {
+      managedWorktreeCreateCount += 1;
+      const body = parseManagedWorktreeRequest(route.request().postDataJSON());
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          repo_root: body.repo_root,
+          path: `/Users/penso/.arbor/worktrees/arbor/${body.worktree_name}`,
+          branch: `codex/${body.worktree_name}`,
+          deleted_branch: null,
+          message: "created",
+        }),
+      });
+    });
+
     await page.goto("/");
   });
 
@@ -139,31 +248,16 @@ test.describe("Arbor Web UI", () => {
   test("sidebar shows repos with worktrees grouped underneath", async ({ page }) => {
     const sidebar = page.getByTestId("sidebar");
 
-    // Repo headers
     await expect(sidebar.locator(".repo-name").getByText("arbor", { exact: true })).toBeVisible();
     await expect(sidebar.locator(".repo-name").getByText("moltis", { exact: true })).toBeVisible();
-
-    // GitHub icon for repo without avatar (arbor has slug but no avatar_url)
     await expect(sidebar.locator(".repo-icon-github").first()).toBeVisible();
-
-    // GitHub avatar for repo with avatar_url (moltis)
     await expect(sidebar.locator(".repo-avatar")).toBeVisible();
-
-    // Worktree cards under their repo
     await expect(sidebar.locator(".wt-branch").getByText("main").first()).toBeVisible();
     await expect(sidebar.locator(".wt-branch").getByText("feature/auth")).toBeVisible();
-
-    // Git branch icons on worktree cards
     await expect(sidebar.locator(".wt-branch-icon").first()).toBeVisible();
-
-    // Diff stats on worktrees
     await expect(sidebar.locator(".wt-diff-add").getByText("+84")).toBeVisible();
     await expect(sidebar.locator(".wt-diff-del").getByText("-2")).toBeVisible();
-
-    // PR number on feature/auth worktree
     await expect(sidebar.locator(".wt-pr").getByText("#365")).toBeVisible();
-
-    // Worktree count badges
     await expect(sidebar.locator(".repo-wt-count").getByText("2")).toBeVisible();
     await expect(sidebar.locator(".repo-wt-count").getByText("1")).toBeVisible();
 
@@ -175,14 +269,10 @@ test.describe("Arbor Web UI", () => {
 
   test("collapsing repo hides its worktrees", async ({ page }) => {
     const sidebar = page.getByTestId("sidebar");
-
-    // Click chevron on the arbor repo to collapse
     const arborGroup = sidebar.locator(".repo-group").first();
     await arborGroup.locator(".repo-chevron").click();
 
-    // Worktrees for arbor should be hidden
     await expect(sidebar.locator(".wt-branch").getByText("feature/auth")).not.toBeVisible();
-    // Moltis worktree should still show
     await expect(sidebar.locator(".wt-branch").getByText("main")).toBeVisible();
 
     await page.screenshot({
@@ -193,10 +283,8 @@ test.describe("Arbor Web UI", () => {
 
   test("terminal panel shows session tabs for selected worktree", async ({ page }) => {
     const terminalPanel = page.getByTestId("terminal-panel");
-    // Primary worktree is auto-selected, label follows native behavior (last command first).
     await expect(terminalPanel.locator(".terminal-tab-label").getByText("just test")).toBeVisible();
 
-    // Switch to feature-auth worktree
     const sidebar = page.getByTestId("sidebar");
     await sidebar.locator(".wt-card").nth(1).click();
     await expect(terminalPanel.locator(".terminal-tab-label").getByText("cargo build")).toBeVisible();
@@ -206,14 +294,14 @@ test.describe("Arbor Web UI", () => {
     const sidebar = page.getByTestId("sidebar");
     const terminalPanel = page.getByTestId("terminal-panel");
 
-    // Switch to moltis primary worktree, which has no terminal sessions in mocked data.
     await sidebar.locator(".wt-card").nth(2).click();
 
-    await expect(terminalPanel.locator(".terminal-empty").getByText("Click + to add a terminal")).toBeVisible();
+    await expect(
+      terminalPanel.locator(".terminal-empty").getByText("Click + to add a terminal"),
+    ).toBeVisible();
   });
 
   test("changes panel shows files when worktree selected", async ({ page }) => {
-    // Primary worktree is auto-selected on load, so changes should appear
     const changesPanel = page.getByTestId("changes-panel");
     await expect(changesPanel.getByText("src/main.rs")).toBeVisible();
     await expect(changesPanel.getByText("src/api.rs")).toBeVisible();
@@ -233,8 +321,57 @@ test.describe("Arbor Web UI", () => {
     await expect(statusBar.getByText(/2 terminals/)).toBeVisible();
   });
 
+  test("command palette opens issues tab from keyboard", async ({ page }) => {
+    const changesPanel = page.getByTestId("changes-panel");
+    await expect(changesPanel.getByText("src/main.rs")).toBeVisible();
+
+    await page.evaluate(() => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "k",
+          ctrlKey: true,
+          bubbles: true,
+        }),
+      );
+    });
+    await expect(page.getByTestId("command-palette")).toBeVisible();
+    const paletteInput = page.locator(".palette-input");
+    await paletteInput.fill("issues");
+    await paletteInput.press("Enter");
+
+    await expect(changesPanel.getByText("Ship daemon-backed issue worktrees")).toBeVisible();
+    await expect(changesPanel.getByText("GitHub")).toBeVisible();
+    await expect(changesPanel.locator(".issue-item")).toHaveCount(2);
+    await expect(changesPanel.locator(".issue-item").first()).toContainText("Create worktree");
+  });
+
+  test("issue selection opens a prefilled managed worktree modal", async ({ page }) => {
+    const changesPanel = page.getByTestId("changes-panel");
+    await expect(changesPanel.getByText("src/main.rs")).toBeVisible();
+
+    await changesPanel.getByRole("button", { name: /Issues/ }).click();
+    await expect(changesPanel.getByText("Ship daemon-backed issue worktrees")).toBeVisible();
+
+    await page.locator(".issue-item").first().click();
+
+    const modal = page.getByTestId("create-worktree-modal");
+    await expect(modal).toBeVisible();
+    await expect(modal.locator(".overlay-title")).toHaveText("Create Worktree");
+    await expect(modal.locator(".worktree-input")).toHaveValue("github-512-ship-httpd-issues");
+    await expect(modal.getByText("codex/github-512-ship-httpd-issues")).toBeVisible();
+    await expect(
+      modal.getByText("/Users/penso/.arbor/worktrees/arbor/github-512-ship-httpd-issues"),
+    ).toBeVisible();
+
+    await modal.getByRole("button", { name: "Create worktree" }).click();
+
+    await expect(modal).toBeHidden();
+    await expect(
+      page.getByTestId("sidebar").getByText("codex/github-512-ship-httpd-issues"),
+    ).toBeVisible();
+  });
+
   test("full layout screenshot", async ({ page }) => {
-    // Primary worktree is auto-selected, wait for changes to load
     const changesPanel = page.getByTestId("changes-panel");
     await expect(changesPanel.getByText("src/main.rs")).toBeVisible();
 
@@ -252,22 +389,15 @@ test.describe("Arbor Web UI", () => {
   test("mobile layout shows burger menu", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 667 });
 
-    // Burger button should be visible
     const burgerBtn = page.locator(".burger-btn");
     await expect(burgerBtn).toBeVisible();
 
-    // Sidebar should be hidden initially
     const sidebar = page.getByTestId("sidebar");
     await expect(sidebar).not.toBeInViewport();
 
-    // Click burger to open sidebar
     await burgerBtn.click();
     await expect(sidebar).toHaveClass(/open/);
-
-    // Overlay should be visible
     await expect(page.locator(".sidebar-overlay.visible")).toBeAttached();
-
-    // Terminal panel should still be visible
     await expect(page.getByTestId("terminal-panel")).toBeVisible();
 
     await page.screenshot({
@@ -275,7 +405,6 @@ test.describe("Arbor Web UI", () => {
       fullPage: true,
     });
 
-    // Click overlay to close sidebar
     await page.locator(".sidebar-overlay").click();
     await expect(sidebar).not.toHaveClass(/open/);
   });

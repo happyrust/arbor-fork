@@ -61,6 +61,26 @@ struct RepositorySummary {
     github_repo_slug: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedDaemonTarget {
+    Primary,
+    Remote(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssueTarget {
+    daemon_target: ManagedDaemonTarget,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone)]
+struct CreateModalIssueContext {
+    source_label: String,
+    display_id: String,
+    title: String,
+    url: Option<String>,
+}
+
 type SharedTerminalRuntime = Arc<dyn TerminalRuntimeHandle>;
 
 #[derive(Clone)]
@@ -757,6 +777,7 @@ enum CenterTab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightPaneTab {
     Changes,
+    Issues,
     FileTree,
     Notes,
 }
@@ -1215,6 +1236,12 @@ struct CreateModal {
     outpost_name: String,
     outpost_name_cursor: usize,
     outpost_active_field: CreateOutpostField,
+    daemon_managed_target: Option<ManagedDaemonTarget>,
+    managed_preview: Option<terminal_daemon_http::ManagedWorktreePreviewDto>,
+    managed_preview_loading: bool,
+    managed_preview_error: Option<String>,
+    managed_preview_generation: u64,
+    issue_context: Option<CreateModalIssueContext>,
     // Shared
     is_creating: bool,
     creating_status: Option<String>,
@@ -1335,6 +1362,7 @@ struct CommandPaletteItem {
 #[derive(Debug, Clone)]
 enum CommandPaletteAction {
     OpenCreateWorktree,
+    OpenIssues,
     OpenReviewPullRequest,
     RefreshWorktrees,
     ToggleCompactSidebar,
@@ -1601,6 +1629,12 @@ struct ArborWindow {
     right_pane_search: String,
     right_pane_search_cursor: usize,
     right_pane_search_active: bool,
+    issues: Vec<terminal_daemon_http::IssueDto>,
+    issue_source: Option<terminal_daemon_http::IssueSourceDto>,
+    issues_notice: Option<String>,
+    issues_error: Option<String>,
+    issues_loading: bool,
+    issues_target: Option<IssueTarget>,
     worktree_notes_lines: Vec<String>,
     worktree_notes_cursor: FileViewCursor,
     worktree_notes_path: Option<PathBuf>,
@@ -1646,7 +1680,7 @@ struct ArborWindow {
 
 #[derive(Debug, Clone)]
 struct RemoteDaemonState {
-    client: Arc<terminal_daemon_http::HttpTerminalDaemon>,
+    client: terminal_daemon_http::SharedTerminalDaemonClient,
     hostname: String,
     repositories: Vec<terminal_daemon_http::RemoteRepositoryDto>,
     worktrees: Vec<terminal_daemon_http::RemoteWorktreeDto>,
@@ -1661,4 +1695,5 @@ struct RemoteDaemonState {
 struct ActiveRemoteWorktree {
     daemon_index: usize,
     worktree_path: PathBuf,
+    repo_root: String,
 }

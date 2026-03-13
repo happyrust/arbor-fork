@@ -314,6 +314,12 @@ impl ArborWindow {
                     right_pane_search: String::new(),
                     right_pane_search_cursor: 0,
                     right_pane_search_active: false,
+                    issues: Vec::new(),
+                    issue_source: None,
+                    issues_notice: None,
+                    issues_error: None,
+                    issues_loading: false,
+                    issues_target: None,
                     worktree_notes_lines: vec![String::new()],
                     worktree_notes_cursor: FileViewCursor { line: 0, col: 0 },
                     worktree_notes_path: None,
@@ -668,6 +674,12 @@ impl ArborWindow {
             right_pane_search: String::new(),
             right_pane_search_cursor: 0,
             right_pane_search_active: false,
+            issues: Vec::new(),
+            issue_source: None,
+            issues_notice: None,
+            issues_error: None,
+            issues_loading: false,
+            issues_target: None,
             worktree_notes_lines: vec![String::new()],
             worktree_notes_cursor: FileViewCursor { line: 0, col: 0 },
             worktree_notes_path: None,
@@ -1845,6 +1857,7 @@ impl ArborWindow {
         }
 
         self.sync_active_repository_from_selected_worktree();
+        self.sync_issue_target(cx);
 
         if refresh_errors.is_empty() {
             if self

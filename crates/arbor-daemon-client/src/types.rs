@@ -19,6 +19,32 @@ pub struct RepositoryDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct IssueSourceDto {
+    pub provider: String,
+    pub label: String,
+    pub repository: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct IssueDto {
+    pub id: String,
+    pub display_id: String,
+    pub title: String,
+    pub state: String,
+    pub url: Option<String>,
+    pub suggested_worktree_name: String,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct IssueListResponse {
+    pub source: Option<IssueSourceDto>,
+    pub issues: Vec<IssueDto>,
+    pub notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct WorktreeDto {
     pub repo_root: String,
     pub path: String,
@@ -82,6 +108,25 @@ pub struct CreateWorktreeRequest {
     pub branch: Option<String>,
     pub detach: Option<bool>,
     pub force: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ManagedWorktreePreviewRequest {
+    pub repo_root: String,
+    pub worktree_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ManagedWorktreePreviewResponse {
+    pub sanitized_worktree_name: String,
+    pub branch: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CreateManagedWorktreeRequest {
+    pub repo_root: String,
+    pub worktree_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
