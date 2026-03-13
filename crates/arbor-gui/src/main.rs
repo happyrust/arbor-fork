@@ -6962,33 +6962,7 @@ fn user_home_dir() -> Result<PathBuf, String> {
 }
 
 fn sanitize_worktree_name(value: &str) -> String {
-    let mut sanitized = String::new();
-    let mut previous_dash = false;
-
-    for character in value.trim().chars() {
-        if character.is_ascii_alphanumeric() {
-            sanitized.push(character.to_ascii_lowercase());
-            previous_dash = false;
-            continue;
-        }
-
-        if character == '-' || character == '_' || character == '.' {
-            sanitized.push(character);
-            previous_dash = false;
-            continue;
-        }
-
-        if !previous_dash && !sanitized.is_empty() {
-            sanitized.push('-');
-            previous_dash = true;
-        }
-    }
-
-    while sanitized.ends_with('-') {
-        let _ = sanitized.pop();
-    }
-
-    sanitized
+    arbor_core::worktree_name::sanitize_worktree_name(value)
 }
 
 fn derive_branch_name(worktree_name: &str) -> String {
@@ -7430,6 +7404,10 @@ mod tests {
     fn sanitizes_worktree_name_for_branch_and_path() {
         let sanitized = crate::sanitize_worktree_name("  Remote SSH / Demo  ");
         assert_eq!(sanitized, "remote-ssh-demo");
+        assert_eq!(
+            crate::sanitize_worktree_name("Issue 123 Fix parser... now."),
+            "issue-123-fix-parser-now"
+        );
     }
 
     #[test]
