@@ -1,3 +1,10 @@
+fn ui_state_save_has_work(
+    pending_ui_state_save: Option<&ui_state_store::UiState>,
+    ui_state_save_in_flight: bool,
+) -> bool {
+    pending_ui_state_save.is_some() || ui_state_save_in_flight
+}
+
 impl ArborWindow {
     fn clamp_pane_widths_for_workspace(&mut self, workspace_width: f32) {
         let available_side_width =
@@ -159,6 +166,7 @@ impl ArborWindow {
         }
 
         let Some(next_state) = self.pending_ui_state_save.take() else {
+            self.maybe_finish_quit_after_persistence_flush(cx);
             return;
         };
 
@@ -186,6 +194,7 @@ impl ArborWindow {
                 }
 
                 this.start_pending_ui_state_save(cx);
+                this.maybe_finish_quit_after_persistence_flush(cx);
             });
         }));
     }

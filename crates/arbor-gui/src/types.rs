@@ -1805,6 +1805,7 @@ struct ArborWindow {
     worktree_notes_path: Option<PathBuf>,
     worktree_notes_active: bool,
     worktree_notes_error: Option<String>,
+    worktree_notes_save_pending: bool,
     _worktree_notes_save_task: Option<gpui::Task<()>>,
     file_tree_entries: Vec<FileTreeEntry>,
     file_tree_loading: bool,

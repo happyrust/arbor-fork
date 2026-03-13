@@ -334,6 +334,7 @@ impl ArborWindow {
                     worktree_notes_path: None,
                     worktree_notes_active: false,
                     worktree_notes_error: None,
+                    worktree_notes_save_pending: false,
                     _worktree_notes_save_task: None,
                     file_tree_entries: Vec::new(),
                     file_tree_loading: false,
@@ -737,6 +738,7 @@ impl ArborWindow {
             worktree_notes_path: None,
             worktree_notes_active: false,
             worktree_notes_error: None,
+            worktree_notes_save_pending: false,
             _worktree_notes_save_task: None,
             file_tree_entries: Vec::new(),
             file_tree_loading: false,
@@ -1580,6 +1582,11 @@ impl ArborWindow {
             || self.repository_entries_save.has_work()
             || self.daemon_auth_tokens_save.has_work()
             || self.github_auth_state_save.has_work()
+            || ui_state_save_has_work(
+                self.pending_ui_state_save.as_ref(),
+                self.ui_state_save_in_flight,
+            )
+            || self.worktree_notes_save_pending
         {
             return;
         }
@@ -9305,6 +9312,15 @@ mod tests {
 
         pending.finish();
         assert!(!pending.has_work());
+    }
+
+    #[test]
+    fn ui_state_save_has_work_for_pending_and_inflight_states() {
+        let state = crate::ui_state_store::UiState::default();
+
+        assert!(!crate::ui_state_save_has_work(None, false));
+        assert!(crate::ui_state_save_has_work(Some(&state), false));
+        assert!(crate::ui_state_save_has_work(None, true));
     }
 
     #[test]

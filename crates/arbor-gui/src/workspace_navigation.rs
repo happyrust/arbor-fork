@@ -1536,6 +1536,7 @@ impl ArborWindow {
             return;
         };
         let content = self.worktree_notes_lines.join("\n");
+        self.worktree_notes_save_pending = true;
         self._worktree_notes_save_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -1552,6 +1553,7 @@ impl ArborWindow {
                 .await;
 
             let _ = this.update(cx, |this, cx| {
+                this.worktree_notes_save_pending = false;
                 match result {
                     Ok(saved_path) => {
                         if this.worktree_notes_path.as_ref() == Some(&saved_path) {
@@ -1562,6 +1564,7 @@ impl ArborWindow {
                         this.worktree_notes_error = Some(error);
                     },
                 }
+                this.maybe_finish_quit_after_persistence_flush(cx);
                 cx.notify();
             });
         }));
