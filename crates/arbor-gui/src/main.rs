@@ -793,11 +793,24 @@ impl ArborWindow {
                         return;
                     }
 
+                    let refresh = this.refresh_worktree_inventory(
+                        cx,
+                        WorktreeInventoryRefreshMode::PreserveTerminalState,
+                    );
                     this.refresh_worktree_diff_summaries(cx);
                     this.refresh_worktree_ports(cx);
-                    if this.active_outpost_index.is_some() {
+                    this.refresh_agent_tasks(cx);
+                    this.refresh_agent_sessions(cx);
+                    if refresh.rows_changed {
+                        this.refresh_worktree_pull_requests(cx);
+                    }
+                    let changed_files_changed = if this.active_outpost_index.is_some() {
                         this.refresh_remote_changed_files(cx);
-                    } else if this.reload_changed_files() {
+                        false
+                    } else {
+                        this.reload_changed_files()
+                    };
+                    if changed_files_changed || refresh.visible_change() {
                         cx.notify();
                     }
                 });
@@ -1632,9 +1645,18 @@ impl ArborWindow {
         }
     }
 
-    fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
-        tracing::debug!("refreshing worktrees");
-        let previously_selected = self.selected_worktree_path().map(Path::to_path_buf);
+    fn refresh_worktree_inventory(
+        &mut self,
+        cx: &mut Context<Self>,
+        mode: WorktreeInventoryRefreshMode,
+    ) -> WorktreeInventoryRefreshResult {
+        let previous_local_selection = self.selected_local_worktree_path().map(Path::to_path_buf);
+        let active_repository_group_key = self
+            .active_repository_index
+            .and_then(|repository_index| self.repositories.get(repository_index))
+            .map(|repository| repository.group_key.clone());
+        let preserve_non_local_selection =
+            self.active_outpost_index.is_some() || self.active_remote_worktree.is_some();
         let previous_summaries: HashMap<PathBuf, changes::DiffLineSummary> = self
             .worktrees
             .iter()
@@ -1806,24 +1828,12 @@ impl ArborWindow {
             .iter()
             .any(|worktree| worktree.diff_summary.is_none());
 
-        self.active_worktree_index = previously_selected
-            .and_then(|path| {
-                self.worktrees
-                    .iter()
-                    .position(|worktree| worktree.path == path)
-            })
-            .or_else(|| {
-                self.active_repository_index.and_then(|repository_index| {
-                    self.repositories
-                        .get(repository_index)
-                        .and_then(|repository| {
-                            self.worktrees
-                                .iter()
-                                .position(|worktree| worktree.group_key == repository.group_key)
-                        })
-                })
-            })
-            .or_else(|| (!self.worktrees.is_empty()).then_some(0));
+        self.active_worktree_index = next_active_worktree_index(
+            previous_local_selection.as_deref(),
+            active_repository_group_key.as_deref(),
+            &self.worktrees,
+            preserve_non_local_selection,
+        );
 
         self.active_terminal_by_worktree.retain(|path, _| {
             self.worktrees
@@ -1862,18 +1872,32 @@ impl ArborWindow {
             ));
         }
 
+        self.sync_selected_worktree_notes();
+        let created_terminal = mode.created_terminal(|| {
+            let created = self.ensure_selected_worktree_terminal();
+            if created {
+                self.sync_daemon_session_store(cx);
+            }
+            created
+        });
+
+        WorktreeInventoryRefreshResult {
+            rows_changed,
+            created_terminal,
+        }
+    }
+
+    fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
+        tracing::debug!("refreshing worktrees");
+        let refresh = self
+            .refresh_worktree_inventory(cx, WorktreeInventoryRefreshMode::EnsureSelectedTerminal);
         self.refresh_worktree_diff_summaries(cx);
         self.refresh_worktree_ports(cx);
         self.refresh_agent_tasks(cx);
         self.refresh_agent_sessions(cx);
         self.refresh_worktree_pull_requests(cx);
         let changed_files_changed = self.reload_changed_files();
-        self.sync_selected_worktree_notes();
-        let created_terminal = self.ensure_selected_worktree_terminal();
-        if created_terminal {
-            self.sync_daemon_session_store(cx);
-        }
-        if rows_changed || changed_files_changed || created_terminal {
+        if changed_files_changed || refresh.visible_change() {
             cx.notify();
         }
     }
@@ -3997,6 +4021,36 @@ impl RepositorySummary {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct WorktreeInventoryRefreshResult {
+    rows_changed: bool,
+    created_terminal: bool,
+}
+
+impl WorktreeInventoryRefreshResult {
+    fn visible_change(self) -> bool {
+        self.rows_changed || self.created_terminal
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeInventoryRefreshMode {
+    PreserveTerminalState,
+    EnsureSelectedTerminal,
+}
+
+impl WorktreeInventoryRefreshMode {
+    fn created_terminal<F>(self, ensure_selected_terminal: F) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        match self {
+            Self::PreserveTerminalState => false,
+            Self::EnsureSelectedTerminal => ensure_selected_terminal(),
+        }
+    }
+}
+
 impl EntityInputHandler for ArborWindow {
     fn text_for_range(
         &mut self,
@@ -4799,6 +4853,28 @@ fn worktree_rows_changed(previous: &[WorktreeSummary], next: &[WorktreeSummary])
             || left.branch_divergence != right.branch_divergence
             || left.detected_ports != right.detected_ports
     })
+}
+
+fn next_active_worktree_index(
+    previous_local_selection: Option<&Path>,
+    active_repository_group_key: Option<&str>,
+    worktrees: &[WorktreeSummary],
+    preserve_non_local_selection: bool,
+) -> Option<usize> {
+    if preserve_non_local_selection {
+        return None;
+    }
+
+    previous_local_selection
+        .and_then(|path| worktrees.iter().position(|worktree| worktree.path == path))
+        .or_else(|| {
+            active_repository_group_key.and_then(|group_key| {
+                worktrees
+                    .iter()
+                    .position(|worktree| worktree.group_key == group_key)
+            })
+        })
+        .or_else(|| (!worktrees.is_empty()).then_some(0))
 }
 
 fn estimated_worktree_hover_popover_card_height(
@@ -7300,6 +7376,7 @@ mod tests {
         },
         gpui::{Keystroke, point, px},
         std::{
+            cell::Cell,
             collections::HashMap,
             env, fs,
             path::{Path, PathBuf},
@@ -7482,6 +7559,100 @@ mod tests {
 
         let attention = crate::worktree_attention_indicator(&worktree);
         assert_eq!(attention.label, "Stuck");
+    }
+
+    #[test]
+    fn worktree_rows_changed_detects_external_worktree_addition() {
+        let previous = sample_worktree_summary();
+        let current = sample_worktree_summary();
+        let mut external = sample_worktree_summary();
+        external.path = "/tmp/repo/wt-external".into();
+        external.label = "wt-external".to_owned();
+        external.branch = "feature/external".to_owned();
+
+        assert!(crate::worktree_rows_changed(&[previous], &[
+            current, external
+        ]));
+    }
+
+    #[test]
+    fn selected_worktree_terminal_existing_session_is_not_reported_as_created() {
+        let spawn_called = Cell::new(false);
+
+        let created = crate::selected_worktree_terminal_was_created(true, || {
+            spawn_called.set(true);
+            true
+        });
+
+        assert!(!created);
+        assert!(!spawn_called.get());
+    }
+
+    #[test]
+    fn selected_worktree_terminal_reports_spawn_result_when_missing() {
+        assert!(crate::selected_worktree_terminal_was_created(false, || {
+            true
+        }));
+        assert!(!crate::selected_worktree_terminal_was_created(
+            false,
+            || false
+        ));
+    }
+
+    #[test]
+    fn background_inventory_refresh_does_not_recreate_selected_terminal() {
+        let ensure_called = Cell::new(false);
+
+        let created =
+            crate::WorktreeInventoryRefreshMode::PreserveTerminalState.created_terminal(|| {
+                ensure_called.set(true);
+                true
+            });
+
+        assert!(!created);
+        assert!(!ensure_called.get());
+    }
+
+    #[test]
+    fn explicit_inventory_refresh_reports_selected_terminal_creation() {
+        assert!(
+            crate::WorktreeInventoryRefreshMode::EnsureSelectedTerminal.created_terminal(|| true)
+        );
+        assert!(
+            !crate::WorktreeInventoryRefreshMode::EnsureSelectedTerminal.created_terminal(|| false)
+        );
+    }
+
+    #[test]
+    fn next_active_worktree_index_preserves_non_local_selection() {
+        let worktree = sample_worktree_summary();
+        let group_key = worktree.group_key.clone();
+
+        assert_eq!(
+            crate::next_active_worktree_index(None, Some(group_key.as_str()), &[worktree], true),
+            None
+        );
+    }
+
+    #[test]
+    fn next_active_worktree_index_restores_previous_local_selection() {
+        let first = sample_worktree_summary();
+        let mut second = sample_worktree_summary();
+        second.path = "/tmp/repo/wt-two".into();
+        second.label = "wt-two".to_owned();
+        second.branch = "feature/two".to_owned();
+        let second_path = second.path.clone();
+        let first_group_key = first.group_key.clone();
+
+        assert_eq!(
+            crate::next_active_worktree_index(
+                Some(second_path.as_path()),
+                Some(first_group_key.as_str()),
+                &[first, second],
+                false,
+            ),
+            Some(1)
+        );
     }
 
     #[test]
