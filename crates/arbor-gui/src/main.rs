@@ -314,7 +314,7 @@ impl ArborWindow {
                     terminal_launchers: Vec::new(),
                     last_persisted_ui_state: startup_ui_state,
                     pending_ui_state_save: None,
-                    ui_state_save_in_flight: false,
+                    ui_state_save_in_flight: None,
                     daemon_session_store_save: PendingSave::default(),
                     last_ui_state_error: None,
                     notification_service,
@@ -720,7 +720,7 @@ impl ArborWindow {
             worktree_nav_forward: Vec::new(),
             last_persisted_ui_state: startup_ui_state,
             pending_ui_state_save: None,
-            ui_state_save_in_flight: false,
+            ui_state_save_in_flight: None,
             daemon_session_store_save: PendingSave::default(),
             last_ui_state_error: None,
             notification_service,
@@ -1589,7 +1589,7 @@ impl ArborWindow {
             || background_config_save_has_work(self.pending_app_config_save_count)
             || ui_state_save_has_work(
                 self.pending_ui_state_save.as_ref(),
-                self.ui_state_save_in_flight,
+                self.ui_state_save_in_flight.as_ref(),
             )
             || self.worktree_notes_save_pending
         {
@@ -9388,9 +9388,44 @@ mod tests {
     fn ui_state_save_has_work_for_pending_and_inflight_states() {
         let state = crate::ui_state_store::UiState::default();
 
-        assert!(!crate::ui_state_save_has_work(None, false));
-        assert!(crate::ui_state_save_has_work(Some(&state), false));
-        assert!(crate::ui_state_save_has_work(None, true));
+        assert!(!crate::ui_state_save_has_work(None, None));
+        assert!(crate::ui_state_save_has_work(Some(&state), None));
+        assert!(crate::ui_state_save_has_work(None, Some(&state)));
+    }
+
+    #[test]
+    fn next_pending_ui_state_save_keeps_reverted_state_queued_while_other_save_is_in_flight() {
+        let persisted = crate::ui_state_store::UiState {
+            left_pane_width: Some(240),
+            ..crate::ui_state_store::UiState::default()
+        };
+        let in_flight = crate::ui_state_store::UiState {
+            left_pane_width: Some(320),
+            ..crate::ui_state_store::UiState::default()
+        };
+
+        assert_eq!(
+            crate::next_pending_ui_state_save(&persisted, None, Some(&in_flight), &persisted),
+            Some(persisted),
+        );
+    }
+
+    #[test]
+    fn next_pending_ui_state_save_does_not_duplicate_inflight_state() {
+        let state = crate::ui_state_store::UiState {
+            left_pane_width: Some(320),
+            ..crate::ui_state_store::UiState::default()
+        };
+
+        assert_eq!(
+            crate::next_pending_ui_state_save(
+                &crate::ui_state_store::UiState::default(),
+                None,
+                Some(&state),
+                &state,
+            ),
+            None,
+        );
     }
 
     #[test]

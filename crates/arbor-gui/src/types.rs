@@ -1785,7 +1785,7 @@ struct ArborWindow {
     terminal_launchers: Vec<ExternalLauncher>,
     last_persisted_ui_state: ui_state_store::UiState,
     pending_ui_state_save: Option<ui_state_store::UiState>,
-    ui_state_save_in_flight: bool,
+    ui_state_save_in_flight: Option<ui_state_store::UiState>,
     daemon_session_store_save: PendingSave<Vec<DaemonSessionRecord>>,
     last_ui_state_error: Option<String>,
     notification_service: Box<dyn notifications::NotificationService>,
