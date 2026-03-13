@@ -17,13 +17,45 @@ pub(crate) trait RepositoryIssueProvider: Send + Sync {
     fn list_issues(&self, source: &ResolvedIssueSource) -> Result<Vec<IssueDto>, String>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueProviderKind {
+    GitHub,
+    GitLab,
+}
+
+impl IssueProviderKind {
+    const fn api_name(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::GitLab => "gitlab",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub",
+            Self::GitLab => "GitLab",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedIssueSource {
-    provider: String,
-    label: String,
+    provider: IssueProviderKind,
     repository: String,
     url: Option<String>,
     api_base_url: String,
+}
+
+impl ResolvedIssueSource {
+    fn into_dto(self) -> IssueSourceDto {
+        IssueSourceDto {
+            provider: self.provider.api_name().to_owned(),
+            label: self.provider.label().to_owned(),
+            repository: self.repository,
+            url: self.url,
+        }
+    }
 }
 
 pub(crate) struct RepositoryIssueService {
@@ -54,12 +86,7 @@ impl RepositoryIssueService {
 
             let issues = provider.list_issues(&source)?;
             return Ok(IssueListResponse {
-                source: Some(IssueSourceDto {
-                    provider: source.provider,
-                    label: source.label,
-                    repository: source.repository,
-                    url: source.url,
-                }),
+                source: Some(source.into_dto()),
                 issues,
                 notice: None,
             });
@@ -92,8 +119,7 @@ impl RepositoryIssueProvider for GitHubIssueProvider {
     ) -> Option<ResolvedIssueSource> {
         let repository = github_repo_slug_from_remote_url(origin_remote_url)?;
         Some(ResolvedIssueSource {
-            provider: "github".to_owned(),
-            label: "GitHub".to_owned(),
+            provider: IssueProviderKind::GitHub,
             repository: repository.clone(),
             url: Some(format!("https://github.com/{repository}/issues")),
             api_base_url: "https://api.github.com".to_owned(),
@@ -182,21 +208,7 @@ impl RepositoryIssueProvider for GitLabIssueProvider {
         origin_remote_url: &str,
     ) -> Option<ResolvedIssueSource> {
         let remote = parse_remote(origin_remote_url)?;
-        if !remote.host.contains("gitlab") {
-            return None;
-        }
-
-        let url = format!(
-            "{}://{}/{}/-/issues",
-            remote.scheme, remote.host, remote.path
-        );
-        Some(ResolvedIssueSource {
-            provider: "gitlab".to_owned(),
-            label: "GitLab".to_owned(),
-            repository: remote.path.clone(),
-            url: Some(url),
-            api_base_url: format!("{}://{}/api/v4", remote.scheme, remote.host),
-        })
+        resolve_gitlab_source(&remote, gitlab_instance_supports_issues)
     }
 
     fn list_issues(&self, source: &ResolvedIssueSource) -> Result<Vec<IssueDto>, String> {
@@ -279,11 +291,40 @@ struct GitLabIssuePayload {
     updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteScheme {
+    Http,
+    Https,
+}
+
+impl RemoteScheme {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteHostKind {
+    GitHub,
+    GitLab,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteSpec {
-    scheme: String,
+    scheme: RemoteScheme,
     host: String,
+    host_kind: RemoteHostKind,
     path: String,
+}
+
+impl RemoteSpec {
+    fn base_url(&self) -> String {
+        format!("{}://{}", self.scheme.as_str(), self.host)
+    }
 }
 
 fn origin_remote_url(repo_root: &Path) -> Result<Option<String>, String> {
@@ -309,19 +350,8 @@ fn origin_remote_url(repo_root: &Path) -> Result<Option<String>, String> {
 }
 
 fn github_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
-    let path = remote_url
-        .strip_prefix("git@github.com:")
-        .or_else(|| remote_url.strip_prefix("https://github.com/"))
-        .or_else(|| remote_url.strip_prefix("http://github.com/"))
-        .or_else(|| remote_url.strip_prefix("ssh://git@github.com/"))?;
-
-    let normalized = path.trim_end_matches('/');
-    let repository = normalized.strip_suffix(".git").unwrap_or(normalized);
-    let (owner, repo_name) = repository.split_once('/')?;
-    if owner.is_empty() || repo_name.is_empty() {
-        return None;
-    }
-    Some(format!("{owner}/{repo_name}"))
+    let remote = parse_remote(remote_url)?;
+    github_repo_slug(&remote)
 }
 
 fn parse_remote(remote_url: &str) -> Option<RemoteSpec> {
@@ -329,45 +359,61 @@ fn parse_remote(remote_url: &str) -> Option<RemoteSpec> {
 
     if let Some(rest) = trimmed.strip_prefix("git@") {
         let (host, path) = rest.split_once(':')?;
-        return Some(RemoteSpec {
-            scheme: "https".to_owned(),
-            host: host.to_owned(),
-            path: normalize_remote_path(path)?,
-        });
+        return build_remote_spec(RemoteScheme::Https, host, path);
     }
 
     if let Some(rest) = trimmed.strip_prefix("ssh://") {
         let (authority, path) = rest.split_once('/')?;
-        let host = authority
-            .rsplit_once('@')
-            .map(|(_, host)| host)
-            .unwrap_or(authority);
-        return Some(RemoteSpec {
-            scheme: "https".to_owned(),
-            host: host.to_owned(),
-            path: normalize_remote_path(path)?,
-        });
+        return build_remote_spec(RemoteScheme::Https, authority, path);
     }
 
     if let Some(rest) = trimmed.strip_prefix("https://") {
-        let (host, path) = rest.split_once('/')?;
-        return Some(RemoteSpec {
-            scheme: "https".to_owned(),
-            host: host.to_owned(),
-            path: normalize_remote_path(path)?,
-        });
+        let (authority, path) = rest.split_once('/')?;
+        return build_remote_spec(RemoteScheme::Https, authority, path);
     }
 
     if let Some(rest) = trimmed.strip_prefix("http://") {
-        let (host, path) = rest.split_once('/')?;
-        return Some(RemoteSpec {
-            scheme: "http".to_owned(),
-            host: host.to_owned(),
-            path: normalize_remote_path(path)?,
-        });
+        let (authority, path) = rest.split_once('/')?;
+        return build_remote_spec(RemoteScheme::Http, authority, path);
     }
 
     None
+}
+
+fn build_remote_spec(scheme: RemoteScheme, authority: &str, path: &str) -> Option<RemoteSpec> {
+    let host = sanitize_remote_authority(authority)?;
+    Some(RemoteSpec {
+        scheme,
+        host_kind: classify_remote_host(&host),
+        host,
+        path: normalize_remote_path(path)?,
+    })
+}
+
+fn sanitize_remote_authority(authority: &str) -> Option<String> {
+    let trimmed = authority.trim();
+    let without_userinfo = trimmed
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(trimmed)
+        .trim();
+    if without_userinfo.is_empty() {
+        None
+    } else {
+        Some(without_userinfo.to_owned())
+    }
+}
+
+fn classify_remote_host(host: &str) -> RemoteHostKind {
+    let host_without_port = host
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']').map(|(bare_host, _)| bare_host))
+        .unwrap_or_else(|| host.split(':').next().unwrap_or(host));
+    match host_without_port.to_ascii_lowercase().as_str() {
+        "github.com" => RemoteHostKind::GitHub,
+        "gitlab.com" => RemoteHostKind::GitLab,
+        _ => RemoteHostKind::Other,
+    }
 }
 
 fn normalize_remote_path(path: &str) -> Option<String> {
@@ -400,6 +446,67 @@ fn issue_worktree_name(reference: &str, title: &str) -> String {
     } else {
         format!("{base_reference}-{title_slug}")
     }
+}
+
+fn github_repo_slug(remote: &RemoteSpec) -> Option<String> {
+    if remote.host_kind != RemoteHostKind::GitHub {
+        return None;
+    }
+
+    let (owner, repo_name) = remote.path.split_once('/')?;
+    if owner.is_empty() || repo_name.is_empty() || repo_name.contains('/') {
+        return None;
+    }
+
+    Some(format!("{owner}/{repo_name}"))
+}
+
+fn resolve_gitlab_source<F>(
+    remote: &RemoteSpec,
+    supports_custom_instance: F,
+) -> Option<ResolvedIssueSource>
+where
+    F: FnOnce(&RemoteSpec) -> bool,
+{
+    let is_gitlab = match remote.host_kind {
+        RemoteHostKind::GitHub => false,
+        RemoteHostKind::GitLab => true,
+        RemoteHostKind::Other => supports_custom_instance(remote),
+    };
+    if !is_gitlab {
+        return None;
+    }
+
+    let base_url = remote.base_url();
+    Some(ResolvedIssueSource {
+        provider: IssueProviderKind::GitLab,
+        repository: remote.path.clone(),
+        url: Some(format!("{base_url}/{}/-/issues", remote.path)),
+        api_base_url: format!("{base_url}/api/v4"),
+    })
+}
+
+fn gitlab_instance_supports_issues(remote: &RemoteSpec) -> bool {
+    let url = format!("{}/api/v4/metadata", remote.base_url());
+    let token = gitlab_access_token_from_env();
+    let mut request = ureq::get(&url)
+        .header("Accept", "application/json")
+        .header("User-Agent", "Arbor");
+    if let Some(token) = token.as_deref() {
+        request = request.header("PRIVATE-TOKEN", token);
+    }
+
+    let response = match request
+        .config()
+        .timeout_global(Some(ISSUE_REQUEST_TIMEOUT))
+        .build()
+        .call()
+    {
+        Ok(response) => response,
+        Err(_) => return false,
+    };
+
+    matches!(response.status().as_u16(), 200..=299 | 401 | 403)
 }
 
 fn github_access_token_from_env() -> Option<String> {
@@ -461,19 +568,59 @@ mod tests {
         assert_eq!(
             parse_remote("git@gitlab.com:group/subgroup/arbor.git"),
             Some(RemoteSpec {
-                scheme: "https".to_owned(),
+                scheme: RemoteScheme::Https,
                 host: "gitlab.com".to_owned(),
+                host_kind: RemoteHostKind::GitLab,
                 path: "group/subgroup/arbor".to_owned(),
             })
         );
         assert_eq!(
             parse_remote("https://gitlab.example.com/group/arbor.git"),
             Some(RemoteSpec {
-                scheme: "https".to_owned(),
+                scheme: RemoteScheme::Https,
                 host: "gitlab.example.com".to_owned(),
+                host_kind: RemoteHostKind::Other,
                 path: "group/arbor".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn parse_remote_strips_credentials_from_https_authority() {
+        assert_eq!(
+            parse_remote("https://oauth2:secret-token@gitlab.example.com/group/arbor.git"),
+            Some(RemoteSpec {
+                scheme: RemoteScheme::Https,
+                host: "gitlab.example.com".to_owned(),
+                host_kind: RemoteHostKind::Other,
+                path: "group/arbor".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_gitlab_source_supports_custom_domains_via_probe() {
+        let remote = parse_remote("https://code.company.com/group/arbor.git")
+            .unwrap_or_else(|| panic!("remote should parse"));
+
+        let source = resolve_gitlab_source(&remote, |_| true)
+            .unwrap_or_else(|| panic!("custom GitLab instance should resolve"));
+
+        assert_eq!(source.provider, IssueProviderKind::GitLab);
+        assert_eq!(source.repository, "group/arbor");
+        assert_eq!(
+            source.url.as_deref(),
+            Some("https://code.company.com/group/arbor/-/issues")
+        );
+        assert_eq!(source.api_base_url, "https://code.company.com/api/v4");
+    }
+
+    #[test]
+    fn resolve_gitlab_source_rejects_github_hosts_even_with_positive_probe() {
+        let remote = parse_remote("git@github.com:penso/arbor.git")
+            .unwrap_or_else(|| panic!("remote should parse"));
+
+        assert_eq!(resolve_gitlab_source(&remote, |_| true), None);
     }
 
     #[test]

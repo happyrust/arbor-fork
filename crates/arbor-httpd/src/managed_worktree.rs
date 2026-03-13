@@ -147,9 +147,24 @@ fn non_empty_trimmed_str(value: &str) -> Option<&str> {
 }
 
 fn user_home_dir() -> Result<PathBuf, String> {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| "HOME environment variable is not set".to_owned())
+    if let Some(home) = env::var_os("HOME") {
+        return Ok(PathBuf::from(home));
+    }
+
+    if let Some(home) = env::var_os("USERPROFILE") {
+        return Ok(PathBuf::from(home));
+    }
+
+    let home = match (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH")) {
+        (Some(drive), Some(path)) => {
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            home
+        },
+        _ => return Err("user home directory environment variables are not set".to_owned()),
+    };
+
+    Ok(home)
 }
 
 #[cfg(test)]
