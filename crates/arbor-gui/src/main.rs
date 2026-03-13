@@ -793,7 +793,10 @@ impl ArborWindow {
                         return;
                     }
 
-                    let refresh = this.refresh_worktree_inventory(cx);
+                    let refresh = this.refresh_worktree_inventory(
+                        cx,
+                        WorktreeInventoryRefreshMode::PreserveTerminalState,
+                    );
                     this.refresh_worktree_diff_summaries(cx);
                     this.refresh_worktree_ports(cx);
                     this.refresh_agent_tasks(cx);
@@ -1645,6 +1648,7 @@ impl ArborWindow {
     fn refresh_worktree_inventory(
         &mut self,
         cx: &mut Context<Self>,
+        mode: WorktreeInventoryRefreshMode,
     ) -> WorktreeInventoryRefreshResult {
         let previously_selected = self.selected_worktree_path().map(Path::to_path_buf);
         let previous_summaries: HashMap<PathBuf, changes::DiffLineSummary> = self
@@ -1875,10 +1879,13 @@ impl ArborWindow {
         }
 
         self.sync_selected_worktree_notes();
-        let created_terminal = self.ensure_selected_worktree_terminal();
-        if created_terminal {
-            self.sync_daemon_session_store(cx);
-        }
+        let created_terminal = mode.created_terminal(|| {
+            let created = self.ensure_selected_worktree_terminal();
+            if created {
+                self.sync_daemon_session_store(cx);
+            }
+            created
+        });
 
         WorktreeInventoryRefreshResult {
             rows_changed,
@@ -1888,7 +1895,8 @@ impl ArborWindow {
 
     fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
         tracing::debug!("refreshing worktrees");
-        let refresh = self.refresh_worktree_inventory(cx);
+        let refresh = self
+            .refresh_worktree_inventory(cx, WorktreeInventoryRefreshMode::EnsureSelectedTerminal);
         self.refresh_worktree_diff_summaries(cx);
         self.refresh_worktree_ports(cx);
         self.refresh_agent_tasks(cx);
@@ -4028,6 +4036,24 @@ struct WorktreeInventoryRefreshResult {
 impl WorktreeInventoryRefreshResult {
     fn visible_change(self) -> bool {
         self.rows_changed || self.created_terminal
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeInventoryRefreshMode {
+    PreserveTerminalState,
+    EnsureSelectedTerminal,
+}
+
+impl WorktreeInventoryRefreshMode {
+    fn created_terminal<F>(self, ensure_selected_terminal: F) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        match self {
+            Self::PreserveTerminalState => false,
+            Self::EnsureSelectedTerminal => ensure_selected_terminal(),
+        }
     }
 }
 
@@ -7555,6 +7581,30 @@ mod tests {
             false,
             || false
         ));
+    }
+
+    #[test]
+    fn background_inventory_refresh_does_not_recreate_selected_terminal() {
+        let ensure_called = Cell::new(false);
+
+        let created =
+            crate::WorktreeInventoryRefreshMode::PreserveTerminalState.created_terminal(|| {
+                ensure_called.set(true);
+                true
+            });
+
+        assert!(!created);
+        assert!(!ensure_called.get());
+    }
+
+    #[test]
+    fn explicit_inventory_refresh_reports_selected_terminal_creation() {
+        assert!(
+            crate::WorktreeInventoryRefreshMode::EnsureSelectedTerminal.created_terminal(|| true)
+        );
+        assert!(
+            !crate::WorktreeInventoryRefreshMode::EnsureSelectedTerminal.created_terminal(|| false)
+        );
     }
 
     #[test]
