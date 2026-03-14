@@ -898,6 +898,7 @@ pub(crate) async fn agent_notify(
         request.session_id.clone(),
         request.cwd.clone(),
         agent_state,
+        AgentSessionUpdateSource::Hook,
     )
     .await;
 
@@ -916,6 +917,7 @@ pub(crate) async fn apply_terminal_activity_event(state: &AppState, event: Termi
                 terminal_agent_session_key(&session_id),
                 cwd.display().to_string(),
                 agent_state,
+                AgentSessionUpdateSource::TerminalActivity,
             )
             .await;
         },
@@ -930,6 +932,7 @@ async fn upsert_agent_session(
     session_id: String,
     cwd: String,
     agent_state: AgentState,
+    source: AgentSessionUpdateSource,
 ) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -969,7 +972,7 @@ async fn upsert_agent_session(
         "agent session updated, broadcasting"
     );
     if let Some(event_name) =
-        notification_event_name_for_agent_transition(previous_state, agent_state)
+        notification_event_name_for_agent_transition(source, previous_state, agent_state)
         && let Ok(repo_root) = worktree::repo_root(&cwd_path)
     {
         let branch = git_branch_name_for_worktree(&cwd_path).ok();
@@ -1011,6 +1014,12 @@ async fn remove_agent_session(state: &AppState, session_id: &str) {
 
 fn terminal_agent_session_key(session_id: &SessionId) -> String {
     format!("terminal:{session_id}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSessionUpdateSource {
+    Hook,
+    TerminalActivity,
 }
 
 pub(crate) async fn list_agent_activity(
@@ -1309,9 +1318,14 @@ fn notification_payload_field<'a>(payload: &'a serde_json::Value, key: &str) -> 
 }
 
 fn notification_event_name_for_agent_transition(
+    source: AgentSessionUpdateSource,
     previous_state: Option<AgentState>,
     current_state: AgentState,
 ) -> Option<&'static str> {
+    if source == AgentSessionUpdateSource::TerminalActivity {
+        return None;
+    }
+
     match (previous_state, current_state) {
         (Some(AgentState::Working), AgentState::Working)
         | (Some(AgentState::Waiting), AgentState::Waiting) => None,
@@ -2183,11 +2197,16 @@ mod tests {
     #[test]
     fn notification_event_name_tracks_agent_state_transitions() {
         assert_eq!(
-            notification_event_name_for_agent_transition(None, AgentState::Working),
+            notification_event_name_for_agent_transition(
+                AgentSessionUpdateSource::Hook,
+                None,
+                AgentState::Working,
+            ),
             Some("agent_started")
         );
         assert_eq!(
             notification_event_name_for_agent_transition(
+                AgentSessionUpdateSource::Hook,
                 Some(AgentState::Working),
                 AgentState::Waiting,
             ),
@@ -2195,7 +2214,28 @@ mod tests {
         );
         assert_eq!(
             notification_event_name_for_agent_transition(
+                AgentSessionUpdateSource::Hook,
                 Some(AgentState::Waiting),
+                AgentState::Waiting,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_activity_transitions_do_not_emit_notification_events() {
+        assert_eq!(
+            notification_event_name_for_agent_transition(
+                AgentSessionUpdateSource::TerminalActivity,
+                None,
+                AgentState::Waiting,
+            ),
+            None
+        );
+        assert_eq!(
+            notification_event_name_for_agent_transition(
+                AgentSessionUpdateSource::TerminalActivity,
+                Some(AgentState::Working),
                 AgentState::Waiting,
             ),
             None
