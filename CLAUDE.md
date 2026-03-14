@@ -90,7 +90,8 @@ When adding or modifying UI, use `screencapture -x /tmp/screenshot.png` to take 
 ## Changelog
 
 - Use `git-cliff` for changelog generation (config: `cliff.toml`).
-- `just changelog` / `just changelog-unreleased` / `just changelog-release <version>`
+- `CHANGELOG.md` is generated for release artifacts instead of being tracked in git.
+- `just changelog` / `just changelog-file <path>` / `just changelog-unreleased` / `just changelog-release <version>`
 
 ## Project Structure
 

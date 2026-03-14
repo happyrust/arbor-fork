@@ -16,7 +16,17 @@ New-Item -Path $BinDir -ItemType Directory -Force | Out-Null
 New-Item -Path $ShareDir -ItemType Directory -Force | Out-Null
 Copy-Item -Path $BinaryPath -Destination (Join-Path $BinDir "$AppName.exe") -Force
 Copy-Item -Path README.md -Destination (Join-Path $StagingDir 'README.md') -Force
-Copy-Item -Path CHANGELOG.md -Destination (Join-Path $StagingDir 'CHANGELOG.md') -Force
+
+if ($env:ARBOR_CHANGELOG_PATH) {
+  if (Test-Path $env:ARBOR_CHANGELOG_PATH) {
+    Copy-Item -Path $env:ARBOR_CHANGELOG_PATH -Destination (Join-Path $StagingDir 'CHANGELOG.md') -Force
+    Write-Output "bundled changelog from $($env:ARBOR_CHANGELOG_PATH)"
+  } else {
+    Write-Warning "changelog not found at $($env:ARBOR_CHANGELOG_PATH), skipping bundle"
+  }
+} else {
+  Write-Output 'note: ARBOR_CHANGELOG_PATH not set, skipping changelog bundle'
+}
 
 # Bundle arbor-httpd alongside the main binary
 $HttpdPath = Join-Path (Split-Path $BinaryPath) 'arbor-httpd.exe'

@@ -153,10 +153,13 @@ run-mcp port="": web-ui-build-if-needed
     cargo +{{nightly_toolchain}} run -p arbor-mcp --features stdio-server
 
 changelog:
-    git-cliff --config cliff.toml --output CHANGELOG.md
+    git-cliff --config cliff.toml
 
 changelog-unreleased:
     git-cliff --config cliff.toml --unreleased
+
+changelog-file output:
+    git-cliff --config cliff.toml --output "{{output}}"
 
 changelog-release version:
     git-cliff --config cliff.toml --unreleased --tag "{{version}}" --strip all

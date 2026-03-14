@@ -101,9 +101,11 @@ When adding or modifying UI, use `screencapture -x /tmp/screenshot.png` to take 
 ## Changelog
 
 - Use `git-cliff` for changelog generation.
+- `CHANGELOG.md` is generated for release artifacts and is not tracked in git.
 - Config file: `cliff.toml`
 - Commands:
   - `just changelog`
+  - `just changelog-file <path>`
   - `just changelog-unreleased`
   - `just changelog-release <version>`
 

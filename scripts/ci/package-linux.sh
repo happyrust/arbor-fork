@@ -25,7 +25,16 @@ is_lfs_pointer() {
 mkdir -p "${STAGING_DIR}/bin" "${STAGING_DIR}/share/arbor"
 install -m 0755 "${BINARY_PATH}" "${STAGING_DIR}/bin/${APP_NAME}"
 cp README.md "${STAGING_DIR}/README.md"
-cp CHANGELOG.md "${STAGING_DIR}/CHANGELOG.md"
+
+CHANGELOG_PATH="${ARBOR_CHANGELOG_PATH:-}"
+if [[ -n "${CHANGELOG_PATH}" && -f "${CHANGELOG_PATH}" ]]; then
+  cp "${CHANGELOG_PATH}" "${STAGING_DIR}/CHANGELOG.md"
+  echo "bundled changelog from ${CHANGELOG_PATH}"
+elif [[ -n "${CHANGELOG_PATH}" ]]; then
+  echo "warning: changelog not found at ${CHANGELOG_PATH}, skipping bundle"
+else
+  echo "note: ARBOR_CHANGELOG_PATH not set, skipping changelog bundle"
+fi
 
 # Bundle arbor-httpd alongside the main binary.
 HTTPD_PATH="$(dirname "${BINARY_PATH}")/arbor-httpd"

@@ -1,4 +1,5 @@
 /target
+/CHANGELOG.md
 .DS_Store
 docs/book
 crates/arbor-web-ui/app/node_modules

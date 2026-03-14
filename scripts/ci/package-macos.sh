@@ -92,15 +92,16 @@ else
   echo "warning: icons not found at ${ICONS_DIR}, skipping bundle"
 fi
 
-# Bundle changelog so release archives ship the current release notes with the app.
-CHANGELOG_PATH="${ROOT_DIR}/CHANGELOG.md"
-if [[ -f "${CHANGELOG_PATH}" ]]; then
+# Bundle a generated changelog when release automation provides one.
+CHANGELOG_PATH="${ARBOR_CHANGELOG_PATH:-}"
+if [[ -n "${CHANGELOG_PATH}" && -f "${CHANGELOG_PATH}" ]]; then
   cp "${CHANGELOG_PATH}" "${RESOURCES_DIR}/CHANGELOG.md"
   echo "bundled changelog from ${CHANGELOG_PATH}"
-else
+elif [[ -n "${CHANGELOG_PATH}" ]]; then
   echo "warning: changelog not found at ${CHANGELOG_PATH}, skipping bundle"
+else
+  echo "note: ARBOR_CHANGELOG_PATH not set, skipping changelog bundle"
 fi
-
 cp "${ROOT_DIR}/packaging/macos/Info.plist" "${CONTENTS_DIR}/Info.plist"
 printf 'APPL????' > "${CONTENTS_DIR}/PkgInfo"
 

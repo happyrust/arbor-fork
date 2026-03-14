@@ -131,9 +131,38 @@ jobs:
       - name: Check arbor-httpd with Ghostty VT
         run: cargo +${{ env.NIGHTLY_TOOLCHAIN }} check -p arbor-httpd --features ghostty-vt-experimental
 
+  release-metadata:
+    name: Generate Release Metadata
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: stable
+      - name: Install git-cliff
+        run: cargo install --locked --version 2.12.0 git-cliff
+      - name: Generate changelog and release notes
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: ./scripts/ci/generate-release-changelog.sh "$TAG" release-metadata
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-metadata
+          path: |
+            release-metadata/CHANGELOG.md
+            release-metadata/RELEASE_NOTES.md
+          if-no-files-found: error
+
   build-macos:
     name: Build macOS app
-    needs: [fmt, clippy, test, ghostty-vt]
+    needs: [fmt, clippy, test, ghostty-vt, release-metadata]
     runs-on: macos-14
     permissions:
       contents: read
@@ -164,10 +193,15 @@ jobs:
       - name: Build web UI assets
         working-directory: crates/arbor-web-ui/app
         run: npm ci --no-audit --no-fund && npm run build
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-metadata
+          path: release-metadata
       - name: Package macOS app
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
+          ARBOR_CHANGELOG_PATH: ${{ github.workspace }}/release-metadata/CHANGELOG.md
         run: |
           mkdir -p dist
           lipo -create \
@@ -326,7 +360,7 @@ jobs:
 
   build-linux:
     name: Build Linux app (${{ matrix.target }})
-    needs: [fmt, clippy, test, ghostty-vt]
+    needs: [fmt, clippy, test, ghostty-vt, release-metadata]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -404,11 +438,16 @@ jobs:
       - name: Build web UI assets
         working-directory: crates/arbor-web-ui/app
         run: npm ci --no-audit --no-fund && npm run build
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-metadata
+          path: release-metadata
       - name: Package Linux app
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
           TARGET: ${{ matrix.target }}
+          ARBOR_CHANGELOG_PATH: ${{ github.workspace }}/release-metadata/CHANGELOG.md
         run: |
           mkdir -p dist
           ./scripts/ci/package-linux.sh "$TAG" "$TARGET" "target/${TARGET}/release/Arbor" "dist"
@@ -420,7 +459,7 @@ jobs:
 
   build-windows:
     name: Build Windows app
-    needs: [fmt, clippy, test, ghostty-vt]
+    needs: [fmt, clippy, test, ghostty-vt, release-metadata]
     runs-on: windows-latest
     permissions:
       contents: read
@@ -444,9 +483,14 @@ jobs:
       - name: Build web UI assets
         working-directory: crates/arbor-web-ui/app
         run: npm ci --no-audit --no-fund && npm run build
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-metadata
+          path: release-metadata
       - name: Package Windows app
         env:
           TAG: ${{ github.ref_name }}
+          ARBOR_CHANGELOG_PATH: ${{ github.workspace }}\release-metadata\CHANGELOG.md
         run: |
           New-Item -Path dist -ItemType Directory -Force | Out-Null
           .\scripts\ci\package-windows.ps1 -Tag "$env:TAG" -TargetTriple "x86_64-pc-windows-msvc" -BinaryPath "target\x86_64-pc-windows-msvc\release\Arbor.exe" -OutputDir "dist"
@@ -471,18 +515,23 @@ jobs:
           path: dist
           pattern: release-*
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-metadata
+          path: release-metadata
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          cp CHANGELOG.md dist/CHANGELOG.md
+          cp release-metadata/CHANGELOG.md dist/CHANGELOG.md
           ls -lah dist
           tag="${GITHUB_REF_NAME}"
           if gh release view "${tag}" >/dev/null 2>&1; then
             gh release upload "${tag}" dist/* --clobber
+            gh release edit "${tag}" --title "${tag}" --notes-file release-metadata/RELEASE_NOTES.md
           else
-            gh release create "${tag}" dist/* --title "${tag}" --generate-notes
+            gh release create "${tag}" dist/* --title "${tag}" --notes-file release-metadata/RELEASE_NOTES.md --verify-tag
           fi
 
   update-homebrew:
