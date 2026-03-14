@@ -2167,7 +2167,7 @@ async fn lookup_pr_cached(
         None => return (None, None),
     };
 
-    let cache_key = format!("{slug}:{branch}");
+    let cache_key = pr_cache_key(slug, branch, is_primary);
 
     // Check cache and evict expired entries
     {
@@ -2195,9 +2195,55 @@ async fn lookup_pr_cached(
     (pr_number, pr_url)
 }
 
+fn pr_cache_key(slug: &str, branch: &str, is_primary: bool) -> String {
+    format!(
+        "{slug}:{branch}:{}",
+        if is_primary {
+            "primary"
+        } else {
+            "linked"
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        std::sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct MockGitHubPrService {
+        lookup_count: AtomicUsize,
+    }
+
+    impl MockGitHubPrService {
+        fn new() -> Self {
+            Self {
+                lookup_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl GitHubPrService for MockGitHubPrService {
+        fn lookup_pr_for_branch(
+            &self,
+            _repo_slug: Option<String>,
+            branch: String,
+            is_primary: bool,
+        ) -> futures_util::future::BoxFuture<'static, (Option<u64>, Option<String>)> {
+            self.lookup_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if is_primary {
+                    (None, None)
+                } else {
+                    let url = format!("https://github.com/penso/arbor/pull/{}", 55);
+                    let _ = branch;
+                    (Some(55), Some(url))
+                }
+            })
+        }
+    }
 
     #[test]
     fn issue_worktree_data_from_entries_keeps_primary_checkout() {
@@ -2220,6 +2266,39 @@ mod tests {
         assert_eq!(worktrees.len(), 2);
         assert_eq!(worktrees[0].path, repo_root);
         assert_eq!(worktrees[0].branch, "issue-55");
+    }
+
+    #[tokio::test]
+    async fn lookup_pr_cached_distinguishes_primary_and_linked_results() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let github_service = Arc::new(MockGitHubPrService::new());
+
+        let primary = lookup_pr_cached(
+            cache.clone(),
+            github_service.clone(),
+            Some("penso/arbor"),
+            "issue-55",
+            true,
+        )
+        .await;
+        let linked = lookup_pr_cached(
+            cache,
+            github_service.clone(),
+            Some("penso/arbor"),
+            "issue-55",
+            false,
+        )
+        .await;
+
+        assert_eq!(primary, (None, None));
+        assert_eq!(
+            linked,
+            (
+                Some(55),
+                Some("https://github.com/penso/arbor/pull/55".to_owned()),
+            )
+        );
+        assert_eq!(github_service.lookup_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
