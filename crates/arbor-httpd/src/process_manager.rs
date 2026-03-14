@@ -3,7 +3,7 @@ use {
         daemon::{
             CreateOrAttachRequest, KillRequest, TerminalDaemon, TerminalSessionState, default_shell,
         },
-        process::{ProcessInfo, ProcessSource, ProcessStatus, procfile_managed_process_title},
+        process::{ProcessInfo, ProcessSource, ProcessStatus, managed_process_session_title},
         procfile, repo_config, worktree,
     },
     serde::Serialize,
@@ -345,7 +345,6 @@ impl ProcessManager {
 
             process.exit_code = session.and_then(|session| session.exit_code);
             process.status = ProcessStatus::Crashed;
-            process.session_id = None;
 
             let _ = self.broadcast.send(ProcessEvent::Update {
                 process: process.info(),
@@ -481,6 +480,8 @@ impl ProcessManager {
                 .ok_or_else(|| format!("process `{}` not found", definition.id));
         }
 
+        self.clear_stale_session(&definition.id, daemon)?;
+
         let session_id = session_id_for_process(&definition);
         let result = daemon.create_or_attach(CreateOrAttachRequest {
             session_id: session_id.clone().into(),
@@ -489,7 +490,10 @@ impl ProcessManager {
             shell: default_shell(),
             cols: 120,
             rows: 35,
-            title: Some(procfile_managed_process_title(&definition.name)),
+            title: Some(managed_process_session_title(
+                definition.source,
+                &definition.name,
+            )),
             command: Some(definition.command.clone()),
         });
 
@@ -526,6 +530,45 @@ impl ProcessManager {
                 Err(error.to_string())
             },
         }
+    }
+
+    fn clear_stale_session<D>(&mut self, process_id: &str, daemon: &mut D) -> Result<(), String>
+    where
+        D: TerminalDaemon,
+        D::Error: ToString,
+    {
+        let session_id = self.processes.get(process_id).and_then(|process| {
+            if process.status == ProcessStatus::Running {
+                None
+            } else {
+                process.session_id.clone()
+            }
+        });
+        let Some(session_id) = session_id else {
+            return Ok(());
+        };
+
+        let session_exists = daemon
+            .list_sessions()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|session| session.session_id.as_str() == session_id);
+
+        if session_exists {
+            daemon
+                .kill(KillRequest {
+                    session_id: session_id.clone().into(),
+                })
+                .map_err(|error| error.to_string())?;
+        }
+
+        if let Some(process) = self.processes.get_mut(process_id)
+            && process.session_id.as_deref() == Some(session_id.as_str())
+        {
+            process.session_id = None;
+        }
+
+        Ok(())
     }
 
     fn stop_process_by_id<D>(
@@ -729,7 +772,121 @@ fn process_source_label(source: ProcessSource) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        crate::process_manager::{
+            ManagedProcess, ProcessManager, build_process_definition, session_id_for_process,
+        },
+        arbor_core::{
+            SessionId, WorkspaceId,
+            daemon::{
+                CreateOrAttachRequest, CreateOrAttachResponse, DaemonSessionRecord, DetachRequest,
+                KillRequest, ResizeRequest, SignalRequest, SnapshotRequest, TerminalDaemon,
+                TerminalSessionState, TerminalSnapshot, WriteRequest,
+            },
+            process::{ProcessSource, ProcessStatus, managed_process_session_title},
+        },
+        std::{
+            collections::HashMap,
+            io,
+            path::{Path, PathBuf},
+            time::Duration,
+        },
+    };
+
+    #[derive(Default)]
+    struct TestTerminalDaemon {
+        create_requests: Vec<CreateOrAttachRequest>,
+        killed_session_ids: Vec<String>,
+        sessions: HashMap<String, DaemonSessionRecord>,
+    }
+
+    impl TestTerminalDaemon {
+        fn insert_session(&mut self, session: DaemonSessionRecord) {
+            self.sessions
+                .insert(session.session_id.as_str().to_owned(), session);
+        }
+
+        fn session_state(&self, session_id: &str) -> Option<TerminalSessionState> {
+            self.sessions
+                .get(session_id)
+                .and_then(|session| session.state)
+        }
+    }
+
+    impl TerminalDaemon for TestTerminalDaemon {
+        type Error = io::Error;
+
+        fn create_or_attach(
+            &mut self,
+            request: CreateOrAttachRequest,
+        ) -> Result<CreateOrAttachResponse, Self::Error> {
+            self.create_requests.push(request.clone());
+
+            if let Some(existing) = self.sessions.get(request.session_id.as_str()).cloned() {
+                return Ok(CreateOrAttachResponse {
+                    is_new_session: false,
+                    session: existing,
+                });
+            }
+
+            let session = DaemonSessionRecord {
+                session_id: request.session_id.clone(),
+                workspace_id: request.workspace_id.clone(),
+                cwd: request.cwd.clone(),
+                shell: request.shell.clone(),
+                root_pid: None,
+                cols: request.cols,
+                rows: request.rows,
+                title: request.title.clone(),
+                last_command: request.command.clone(),
+                output_tail: None,
+                exit_code: None,
+                state: Some(TerminalSessionState::Running),
+                updated_at_unix_ms: None,
+            };
+            self.sessions
+                .insert(session.session_id.as_str().to_owned(), session.clone());
+
+            Ok(CreateOrAttachResponse {
+                is_new_session: true,
+                session,
+            })
+        }
+
+        fn write(&mut self, _request: WriteRequest) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _request: ResizeRequest) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn signal(&mut self, _request: SignalRequest) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn detach(&mut self, _request: DetachRequest) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn kill(&mut self, request: KillRequest) -> Result<(), Self::Error> {
+            self.killed_session_ids
+                .push(request.session_id.as_str().to_owned());
+            self.sessions.remove(request.session_id.as_str());
+            Ok(())
+        }
+
+        fn snapshot(
+            &self,
+            _request: SnapshotRequest,
+        ) -> Result<Option<TerminalSnapshot>, Self::Error> {
+            Ok(None)
+        }
+
+        fn list_sessions(&self) -> Result<Vec<DaemonSessionRecord>, Self::Error> {
+            Ok(self.sessions.values().cloned().collect())
+        }
+    }
 
     #[test]
     fn procfile_definitions_are_worktree_scoped() {
@@ -790,5 +947,128 @@ mod tests {
 
         let infos = manager.list_processes_for_workspace(&workspace_path, &[definition]);
         assert_eq!(infos.len(), 2);
+    }
+
+    #[test]
+    fn restart_tracked_process_replaces_completed_session() {
+        let repo_root = PathBuf::from("/tmp/repo");
+        let workspace_path = PathBuf::from("/tmp/repo");
+        let definition = build_process_definition(
+            ProcessSource::Procfile,
+            &repo_root,
+            &workspace_path,
+            "web".to_owned(),
+            "cargo run".to_owned(),
+            workspace_path.clone(),
+            false,
+            true,
+        );
+        let session_id = session_id_for_process(&definition);
+
+        let mut manager = ProcessManager::new();
+        manager
+            .processes
+            .insert(definition.id.clone(), ManagedProcess {
+                definition: definition.clone(),
+                status: ProcessStatus::Running,
+                session_id: Some(session_id.clone()),
+                exit_code: None,
+                restart_count: 0,
+                last_start: None,
+                current_backoff_secs: 1,
+            });
+
+        let mut daemon = TestTerminalDaemon::default();
+        daemon.insert_session(DaemonSessionRecord {
+            session_id: SessionId::new(session_id.clone()),
+            workspace_id: WorkspaceId::new(workspace_path.display().to_string()),
+            cwd: workspace_path.clone(),
+            shell: "/bin/zsh".to_owned(),
+            root_pid: None,
+            cols: 120,
+            rows: 35,
+            title: Some(managed_process_session_title(
+                ProcessSource::Procfile,
+                &definition.name,
+            )),
+            last_command: Some(definition.command.clone()),
+            output_tail: None,
+            exit_code: Some(1),
+            state: Some(TerminalSessionState::Completed),
+            updated_at_unix_ms: None,
+        });
+
+        let restart_schedule = manager.check_and_update(&mut daemon);
+        assert_eq!(restart_schedule, vec![(
+            definition.id.clone(),
+            Duration::from_secs(1)
+        )]);
+
+        let restarted = match manager.restart_tracked_process(&definition.id, &mut daemon) {
+            Ok(process) => process,
+            Err(error) => panic!("restart should succeed: {error}"),
+        };
+        assert_eq!(restarted.status, ProcessStatus::Running);
+        assert_eq!(restarted.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(daemon.killed_session_ids, vec![session_id.clone()]);
+        assert_eq!(
+            daemon.session_state(&session_id),
+            Some(TerminalSessionState::Running)
+        );
+    }
+
+    #[test]
+    fn start_process_uses_source_specific_session_titles() {
+        let repo_root = PathBuf::from("/tmp/repo");
+        let workspace_path = PathBuf::from("/tmp/repo");
+        let procfile_definition = build_process_definition(
+            ProcessSource::Procfile,
+            &repo_root,
+            &workspace_path,
+            "web".to_owned(),
+            "cargo run".to_owned(),
+            workspace_path.clone(),
+            false,
+            false,
+        );
+        let arbor_toml_definition = build_process_definition(
+            ProcessSource::ArborToml,
+            &repo_root,
+            &workspace_path,
+            "worker".to_owned(),
+            "cargo run -- worker".to_owned(),
+            workspace_path.clone(),
+            false,
+            false,
+        );
+        let definitions = [procfile_definition.clone(), arbor_toml_definition.clone()];
+
+        let mut manager = ProcessManager::new();
+        let mut daemon = TestTerminalDaemon::default();
+
+        match manager.start_process(&procfile_definition.id, &definitions, &mut daemon) {
+            Ok(_) => {},
+            Err(error) => panic!("Procfile process should start: {error}"),
+        }
+        match manager.start_process(&arbor_toml_definition.id, &definitions, &mut daemon) {
+            Ok(_) => {},
+            Err(error) => panic!("arbor.toml process should start: {error}"),
+        }
+
+        let recorded_titles: Vec<Option<String>> = daemon
+            .create_requests
+            .into_iter()
+            .map(|request| request.title)
+            .collect();
+        assert_eq!(recorded_titles, vec![
+            Some(managed_process_session_title(
+                ProcessSource::Procfile,
+                &procfile_definition.name,
+            )),
+            Some(managed_process_session_title(
+                ProcessSource::ArborToml,
+                &arbor_toml_definition.name,
+            )),
+        ]);
     }
 }

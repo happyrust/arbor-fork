@@ -21,10 +21,15 @@ pub enum ProcessSource {
     Procfile,
 }
 
+pub const ARBOR_TOML_MANAGED_PROCESS_TITLE_PREFIX: &str = "[arbor.toml] ";
 pub const PROCFILE_MANAGED_PROCESS_TITLE_PREFIX: &str = "[Procfile] ";
 
+pub fn managed_process_session_title(source: ProcessSource, process_name: &str) -> String {
+    format!("{}{process_name}", managed_process_title_prefix(source))
+}
+
 pub fn procfile_managed_process_title(process_name: &str) -> String {
-    format!("{PROCFILE_MANAGED_PROCESS_TITLE_PREFIX}{process_name}")
+    managed_process_session_title(ProcessSource::Procfile, process_name)
 }
 
 pub fn procfile_managed_process_name_from_title(title: &str) -> Option<&str> {
@@ -32,6 +37,13 @@ pub fn procfile_managed_process_name_from_title(title: &str) -> Option<&str> {
         .strip_prefix(PROCFILE_MANAGED_PROCESS_TITLE_PREFIX)
         .map(str::trim)
         .filter(|name| !name.is_empty())
+}
+
+fn managed_process_title_prefix(source: ProcessSource) -> &'static str {
+    match source {
+        ProcessSource::ArborToml => ARBOR_TOML_MANAGED_PROCESS_TITLE_PREFIX,
+        ProcessSource::Procfile => PROCFILE_MANAGED_PROCESS_TITLE_PREFIX,
+    }
 }
 
 /// Runtime information about a managed process.
@@ -55,7 +67,8 @@ pub struct ProcessInfo {
 #[cfg(test)]
 mod tests {
     use crate::process::{
-        PROCFILE_MANAGED_PROCESS_TITLE_PREFIX, procfile_managed_process_name_from_title,
+        ARBOR_TOML_MANAGED_PROCESS_TITLE_PREFIX, PROCFILE_MANAGED_PROCESS_TITLE_PREFIX,
+        ProcessSource, managed_process_session_title, procfile_managed_process_name_from_title,
         procfile_managed_process_title,
     };
 
@@ -76,5 +89,16 @@ mod tests {
             procfile_managed_process_name_from_title(PROCFILE_MANAGED_PROCESS_TITLE_PREFIX),
             None
         );
+    }
+
+    #[test]
+    fn arbor_toml_title_uses_distinct_prefix() {
+        let title = managed_process_session_title(ProcessSource::ArborToml, "web");
+
+        assert_eq!(
+            title,
+            format!("{ARBOR_TOML_MANAGED_PROCESS_TITLE_PREFIX}web")
+        );
+        assert_eq!(procfile_managed_process_name_from_title(&title), None);
     }
 }
