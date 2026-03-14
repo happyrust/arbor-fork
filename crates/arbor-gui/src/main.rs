@@ -2642,10 +2642,18 @@ impl ArborWindow {
 
             let _ = this.update(cx, |this, cx| {
                 for (path, next_num, next_url, next_details, rate_limited_until) in results {
+                    let preserve_cached_pr_data = should_preserve_cached_pr_data_on_rate_limit(
+                        next_num,
+                        next_url.as_deref(),
+                        next_details.as_ref(),
+                        rate_limited_until,
+                    );
+
                     if let Some(worktree) = this
                         .worktrees
                         .iter_mut()
                         .find(|worktree| worktree.path == path)
+                        && !preserve_cached_pr_data
                         && (worktree.pr_number != next_num
                             || worktree.pr_url != next_url
                             || worktree.pr_details != next_details)
@@ -6666,6 +6674,18 @@ fn format_countdown(duration: Duration) -> String {
     }
 }
 
+fn should_preserve_cached_pr_data_on_rate_limit(
+    next_num: Option<u64>,
+    next_url: Option<&str>,
+    next_details: Option<&github_service::PrDetails>,
+    rate_limited_until: Option<SystemTime>,
+) -> bool {
+    rate_limited_until.is_some()
+        && next_num.is_none()
+        && next_url.is_none()
+        && next_details.is_none()
+}
+
 fn is_gui_editor(editor: &str) -> bool {
     let basename = Path::new(editor)
         .file_name()
@@ -9264,6 +9284,40 @@ mod tests {
             crate::format_countdown(std::time::Duration::from_secs(3723)),
             "1h 02mn 03s"
         );
+    }
+
+    #[test]
+    fn preserve_cached_pr_data_only_when_rate_limited_without_fresh_pr_data() {
+        let pr = crate::github_service::PrDetails {
+            number: 42,
+            title: "Keep the old PR metadata".to_owned(),
+            url: "https://github.com/penso/arbor/pull/42".to_owned(),
+            state: crate::github_service::PrState::Open,
+            additions: 1,
+            deletions: 1,
+            review_decision: crate::github_service::ReviewDecision::Pending,
+            mergeable: crate::github_service::MergeableState::Mergeable,
+            merge_state_status: crate::github_service::MergeStateStatus::Clean,
+            passed_checks: 0,
+            checks_status: crate::github_service::CheckStatus::Pending,
+            checks: Vec::new(),
+        };
+
+        assert!(crate::should_preserve_cached_pr_data_on_rate_limit(
+            None,
+            None,
+            None,
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60)),
+        ));
+        assert!(!crate::should_preserve_cached_pr_data_on_rate_limit(
+            Some(pr.number),
+            Some(pr.url.as_str()),
+            Some(&pr),
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60)),
+        ));
+        assert!(!crate::should_preserve_cached_pr_data_on_rate_limit(
+            None, None, None, None,
+        ));
     }
 
     #[test]
