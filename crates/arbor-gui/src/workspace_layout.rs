@@ -158,7 +158,7 @@ impl ArborWindow {
             compact_sidebar: Some(self.compact_sidebar),
             execution_mode: Some(self.execution_mode),
             preferred_checkout_kind: Some(self.preferred_checkout_kind),
-            sidebar_order: self.last_persisted_ui_state.sidebar_order.clone(),
+            sidebar_order: self.sidebar_order.clone(),
             repository_sidebar_tabs: self.repository_sidebar_tabs_snapshot(),
             selected_sidebar_selection: self.sidebar_selection_snapshot(),
             right_pane_tab: Some(persisted_right_pane_tab(self.right_pane_tab)),
@@ -293,6 +293,12 @@ impl ArborWindow {
     fn sync_repository_sidebar_tabs_store(&mut self, cx: &mut Context<Self>) {
         let mut next_state = self.queued_ui_state_base();
         next_state.repository_sidebar_tabs = self.repository_sidebar_tabs_snapshot();
+        self.queue_ui_state_save(next_state, cx);
+    }
+
+    fn sync_sidebar_order_store(&mut self, cx: &mut Context<Self>) {
+        let mut next_state = self.queued_ui_state_base();
+        next_state.sidebar_order = self.sidebar_order.clone();
         self.queue_ui_state_save(next_state, cx);
     }
 

@@ -473,607 +473,15 @@ impl ArborWindow {
                                     .when(
                                         repository_sidebar_tab == RepositorySidebarTab::Worktrees,
                                         |this| {
-                                            this.child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(6.))
-                                                    .children(
-                                                        repo_worktrees.into_iter().map(|(index, worktree)| {
-                                                let is_active =
-                                                    self.active_worktree_index == Some(index);
-                                                let diff_summary = worktree.diff_summary;
-                                                let show_pr_loading_indicator =
-                                                    should_show_worktree_pr_loading_indicator(
-                                                        &worktree,
-                                                    );
-                                                let pr_number = worktree.pr_number;
-                                                let pr_url = worktree.pr_url.clone();
-                                                let is_merged_pr = worktree
-                                                    .pr_details
-                                                    .as_ref()
-                                                    .is_some_and(|pr| {
-                                                        pr.state == github_service::PrState::Merged
-                                                    });
-                                                let pr_badge_color = if is_merged_pr {
-                                                    0xbb9af7_u32
-                                                } else {
-                                                    theme.accent
-                                                };
-                                                let branch_divergence = worktree.branch_divergence;
-                                                let pr_details = worktree.pr_details.clone();
-                                                let is_stuck = worktree.stuck_turn_count >= 2;
-                                                let is_primary = worktree.is_primary_checkout;
-                                                let attention = worktree_attention_indicator(&worktree);
-                                                let activity_sparkline = worktree_activity_sparkline(&worktree);
-                                                let detected_ports = worktree.detected_ports.clone();
-                                                let agent_dot_color = match worktree.agent_state {
-                                                    Some(AgentState::Working) => Some(0xe5c07b_u32),
-                                                    Some(AgentState::Waiting) => Some(0x61afef_u32),
-                                                    None => None,
-                                                };
-                                                let row = div()
-                                                    .id(("worktree-row", index))
-                                                    .font_family(FONT_MONO)
-                                                    .cursor_pointer()
-                                                    .rounded_sm()
-                                                    .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                                    .flex()
-                                                    .items_center()
-                                                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
-                                                        this.update_worktree_hover_mouse_position(event.position);
-                                                    }))
-                                                    .on_click(
-                                                        cx.listener(move |this, _, window, cx| {
-                                                            this.select_worktree(index, window, cx)
-                                                        }),
-                                                    )
-                                                    .when(
-                                                        !is_primary
-                                                            || worktree.checkout_kind
-                                                                == CheckoutKind::DiscreteClone,
-                                                        |this| {
-                                                        this.on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.worktree_context_menu = Some(WorktreeContextMenu {
-                                                                worktree_index: index,
-                                                                position: event.position,
-                                                            });
-                                                            this.worktree_hover_popover = None;
-                                                            this._hover_show_task = None;
-                                                            cx.notify();
-                                                        }))
-                                                    },
-                                                    )
-                                                    .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
-                                                        this.update_worktree_hover_mouse_position(window.mouse_position());
-                                                        if *hovered {
-                                                            let mouse_position = window.mouse_position();
-                                                            this.schedule_worktree_hover_popover_show(index, mouse_position.y, cx);
-                                                        } else if this.worktree_hover_popover.as_ref().is_some_and(|p| p.worktree_index == index) {
-                                                            this.schedule_worktree_hover_popover_dismiss(index, cx);
-                                                        } else {
-                                                            this.cancel_worktree_hover_popover_show();
-                                                        }
-                                                    }))
-                                                    // Bordered cell
-                                                    .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .rounded_sm()
-                                                        .border_1()
-                                                        .border_color(rgb(if is_active {
-                                                            theme.accent
-                                                        } else {
-                                                            theme.border
-                                                        }))
-                                                        .bg(rgb(theme.panel_bg))
-                                                        .px_2()
-                                                        .py(px(if compact_sidebar { 4. } else { 6. }))
-                                                        .flex()
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap(px(4.))
-                                                        .hover(|this| {
-                                                            this.bg(rgb(theme.panel_active_bg))
-                                                        })
-                                                        .when(is_active, |this| {
-                                                            this.bg(rgb(theme.panel_active_bg))
-                                                                .border_color(rgb(theme.accent))
-                                                        })
-                                                        .when(is_merged_pr && !is_active, |this| {
-                                                            this.opacity(0.72)
-                                                        })
-                                                    // Git branch icon — vertically centered
-                                                    .child(
-                                                        div()
-                                                            .flex_none()
-                                                            .w(px(18.))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .child(if show_pr_loading_indicator {
-                                                                div()
-                                                                    .text_xs()
-                                                                    .font_weight(
-                                                                        FontWeight::SEMIBOLD,
-                                                                    )
-                                                                    .text_color(rgb(theme.accent))
-                                                                    .child(loading_spinner_frame(
-                                                                        self.loading_animation_frame,
-                                                                    ))
-                                                            } else {
-                                                                div()
-                                                                    .text_size(px(16.))
-                                                                    .text_color(rgb(theme.text_muted))
-                                                                    .child(worktree.checkout_kind.icon())
-                                                            }),
-                                                    )
-                                                    // Two-line text column
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .flex()
-                                                            .flex_col()
-                                                            .gap(px(1.))
-                                                    // Line 1: [spinner] [name] ... [+- lines] [time ago]
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(2.))
-                                                            // Activity spinner dot
-                                                            .when_some(agent_dot_color, |this, color| {
-                                                                this.child(
-                                                                    div()
-                                                                        .flex_none()
-                                                                        .size(px(6.))
-                                                                        .rounded_full()
-                                                                        .bg(rgb(color)),
-                                                                )
-                                                            })
-                                                            .when(is_stuck, |this| {
-                                                                this.child(
-                                                                    div()
-                                                                        .flex_none()
-                                                                        .text_xs()
-                                                                        .text_color(rgb(0xeb6f92))
-                                                                        .child("\u{f071}"),
-                                                                )
-                                                            })
-                                                            // Name/label
-                                                            .child(
-                                                                div()
-                                                                    .min_w_0()
-                                                                    .flex_1()
-                                                                    .overflow_hidden()
-                                                                    .whitespace_nowrap()
-                                                                    .text_ellipsis()
-                                                                    .text_xs()
-                                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                                    .text_color(rgb(theme.text_primary))
-                                                                    .child(if compact_sidebar {
-                                                                        format!(
-                                                                            "{} · {}",
-                                                                            worktree.label,
-                                                                            worktree.branch
-                                                                        )
-                                                                    } else {
-                                                                        worktree.branch.clone()
-                                                                    }),
-                                                            )
-                                                            // Right side: [+- lines] [time ago]
-                                                            .child({
-                                                                let summary =
-                                                                    diff_summary.unwrap_or_default();
-                                                                let show_diff_summary =
-                                                                    summary.additions > 0
-                                                                        || summary.deletions > 0;
-                                                                let mut right = div()
-                                                                    .flex_none()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .gap_1();
-
-                                                                if compact_sidebar {
-                                                                    right = right.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(attention.color))
-                                                                            .child(attention.short_label),
-                                                                    );
-                                                                }
-
-                                                                if self.worktree_stats_loading
-                                                                    && diff_summary.is_none()
-                                                                    && !compact_sidebar
-                                                                {
-                                                                    right = right.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(
-                                                                                theme.text_muted,
-                                                                            ))
-                                                                            .child("..."),
-                                                                    );
-                                                                } else if show_diff_summary
-                                                                    && !compact_sidebar
-                                                                {
-                                                                    if summary.additions > 0 {
-                                                                        right = right.child(
-                                                                            div()
-                                                                                .text_xs()
-                                                                                .text_color(rgb(
-                                                                                    0x72d69c,
-                                                                                ))
-                                                                                .child(format!(
-                                                                                    "+{}",
-                                                                                    summary
-                                                                                        .additions
-                                                                                )),
-                                                                        );
-                                                                    }
-                                                                    if summary.deletions > 0 {
-                                                                        right = right.child(
-                                                                            div()
-                                                                                .text_xs()
-                                                                                .text_color(rgb(
-                                                                                    0xeb6f92,
-                                                                                ))
-                                                                                .child(format!(
-                                                                                    "-{}",
-                                                                                    summary
-                                                                                        .deletions
-                                                                                )),
-                                                                        );
-                                                                    }
-                                                                }
-
-                                                                if let Some(activity_ms) = worktree.last_activity_unix_ms {
-                                                                    right = right.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(
-                                                                                theme.text_disabled,
-                                                                            ))
-                                                                            .child(format_relative_time(activity_ms)),
-                                                                    );
-                                                                }
-
-                                                                if let Some(divergence) = branch_divergence
-                                                                    && !compact_sidebar
-                                                                {
-                                                                    if divergence.ahead > 0 {
-                                                                        right = right.child(
-                                                                            div()
-                                                                                .text_xs()
-                                                                                .text_color(rgb(0x72d69c))
-                                                                                .child(format!(
-                                                                                    "\u{2191}{}",
-                                                                                    divergence.ahead
-                                                                                )),
-                                                                        );
-                                                                    }
-                                                                    if divergence.behind > 0 {
-                                                                        right = right.child(
-                                                                            div()
-                                                                                .text_xs()
-                                                                                .text_color(rgb(0xe5c07b))
-                                                                                .child(format!(
-                                                                                    "\u{2193}{}",
-                                                                                    divergence.behind
-                                                                                )),
-                                                                        );
-                                                                    }
-                                                                }
-                                                                right
-                                                            }),
-                                                    )
-                                                    // Line 2: [agent task or dir name] ... [PR number]
-                                                    .when(!compact_sidebar, |this| this.child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .child(
-                                                                div()
-                                                                    .min_w_0()
-                                                                    .flex_1()
-                                                                    .overflow_hidden()
-                                                                    .whitespace_nowrap()
-                                                                    .text_ellipsis()
-                                                                    .text_xs()
-                                                                    .text_color(rgb(theme.text_disabled))
-                                                                    .child({
-                                                                        let task_or_label = worktree
-                                                                            .agent_task
-                                                                            .clone()
-                                                                            .unwrap_or_else(|| worktree.label.clone());
-                                                                        if activity_sparkline.is_empty() {
-                                                                            format!(
-                                                                                "{} · {}",
-                                                                                attention.label,
-                                                                                task_or_label
-                                                                            )
-                                                                        } else {
-                                                                            format!(
-                                                                                "{} {} · {}",
-                                                                                attention.label,
-                                                                                activity_sparkline,
-                                                                                task_or_label
-                                                                            )
-                                                                        }
-                                                                    }),
-                                                            )
-                                                            .when_some(pr_details.clone(), |this, pr| {
-                                                                let (checks_icon, checks_color) = match pr.checks_status {
-                                                                    github_service::CheckStatus::Success => ("\u{f00c}", 0x72d69c_u32),
-                                                                    github_service::CheckStatus::Failure => ("\u{f00d}", 0xeb6f92_u32),
-                                                                    github_service::CheckStatus::Pending => ("\u{f192}", 0xe5c07b_u32),
-                                                                };
-                                                                let (review_icon, _, review_color) =
-                                                                    review_status_presentation(
-                                                                        pr.review_decision,
-                                                                    );
-
-                                                                let mut badges = this.child(
-                                                                    div()
-                                                                        .flex_none()
-                                                                        .text_xs()
-                                                                        .text_color(rgb(checks_color))
-                                                                        .child(checks_icon),
-                                                                ).child(
-                                                                    div()
-                                                                        .flex_none()
-                                                                        .text_xs()
-                                                                        .text_color(rgb(review_color))
-                                                                        .child(review_icon),
-                                                                );
-
-                                                                if pr.additions > 0 {
-                                                                    badges = badges.child(
-                                                                        div()
-                                                                            .flex_none()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(0x72d69c))
-                                                                            .child(format!("+{}", pr.additions)),
-                                                                    );
-                                                                }
-                                                                if pr.deletions > 0 {
-                                                                    badges = badges.child(
-                                                                        div()
-                                                                            .flex_none()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(0xeb6f92))
-                                                                            .child(format!("-{}", pr.deletions)),
-                                                                    );
-                                                                }
-
-                                                                let mut badges = badges;
-                                                                for port in detected_ports.iter().take(2) {
-                                                                    let port_url = worktree_port_url(port);
-                                                                    let port_id = format!(
-                                                                        "worktree-port-link-{index}-{}",
-                                                                        port.port
-                                                                    );
-                                                                    badges = badges.child(
-                                                                        div()
-                                                                            .id(ElementId::Name(
-                                                                                port_id.into(),
-                                                                            ))
-                                                                            .cursor_pointer()
-                                                                            .flex_none()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(0x72d69c))
-                                                                            .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                                            .child(worktree_port_badge_text(port))
-                                                                            .on_click(cx.listener(
-                                                                                move |this, _, _, cx| {
-                                                                                    this.open_external_url(
-                                                                                        &port_url,
-                                                                                        cx,
-                                                                                    );
-                                                                                    cx.stop_propagation();
-                                                                                },
-                                                                            )),
-                                                                    );
-                                                                }
-
-                                                                badges
-                                                            })
-                                                            .when_some(pr_number, |this, pr_num| {
-                                                                let pr_text = format!("#{pr_num}");
-                                                                if let Some(pr_url) = pr_url.clone() {
-                                                                    this.child(
-                                                                        div()
-                                                                            .id(("worktree-pr-link", index))
-                                                                            .cursor_pointer()
-                                                                            .flex_none()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(pr_badge_color))
-                                                                            .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                                            .child(pr_text)
-                                                                            .on_click(cx.listener(
-                                                                                move |this, _, _, cx| {
-                                                                                    this.open_external_url(
-                                                                                        &pr_url,
-                                                                                        cx,
-                                                                                    );
-                                                                                    cx.stop_propagation();
-                                                                                },
-                                                                            )),
-                                                                    )
-                                                                } else {
-                                                                    this.child(
-                                                                        div()
-                                                                            .flex_none()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(pr_badge_color))
-                                                                            .child(pr_text),
-                                                                    )
-                                                                }
-                                                            })
-                                                            .when(pr_details.is_none() && !detected_ports.is_empty(), |this| {
-                                                                detected_ports.iter().take(2).fold(this, |this, port| {
-                                                                    let port_url = worktree_port_url(port);
-                                                                    let port_id = format!(
-                                                                        "worktree-port-link-{index}-{}",
-                                                                        port.port
-                                                                    );
-                                                                    this.child(
-                                                                        div()
-                                                                            .id(ElementId::Name(
-                                                                                port_id.into(),
-                                                                            ))
-                                                                            .cursor_pointer()
-                                                                            .flex_none()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(0x72d69c))
-                                                                            .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                                            .child(worktree_port_badge_text(port))
-                                                                            .on_click(cx.listener(
-                                                                                move |this, _, _, cx| {
-                                                                                    this.open_external_url(
-                                                                                        &port_url,
-                                                                                        cx,
-                                                                                    );
-                                                                                    cx.stop_propagation();
-                                                                                },
-                                                                            )),
-                                                                    )
-                                                                })
-                                                            }),
-                                                    ))
-                                                    ) // text column
-                                                    ); // bordered cell
-                                                if is_active {
-                                                    row.with_animation(
-                                                        ("worktree-select", selection_epoch),
-                                                        Animation::new(Duration::from_millis(150))
-                                                            .with_easing(ease_in_out),
-                                                        |el, delta| {
-                                                            el.opacity(0.8 + 0.2 * delta)
-                                                        },
-                                                    )
-                                                    .into_any_element()
-                                                } else {
-                                                    row.opacity(0.8).into_any_element()
-                                                }
-                                            }),
-                                        ),
-                                            )
-                                            .when(!repo_outposts.is_empty(), |group| {
-                                                group.child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .gap_1()
-                                                        .children(
-                                                            repo_outposts.into_iter().map(|(outpost_index, outpost)| {
-                                                    let is_active = self.active_outpost_index == Some(outpost_index);
-                                                    let status_color = match outpost.status {
-                                                        arbor_core::outpost::OutpostStatus::Available => theme.accent,
-                                                        arbor_core::outpost::OutpostStatus::Unreachable => 0xeb6f92,
-                                                        arbor_core::outpost::OutpostStatus::NotCloned | arbor_core::outpost::OutpostStatus::Provisioning => theme.text_muted,
-                                                    };
-                                                    div()
-                                                        .id(("outpost-row", outpost_index))
-                                                        .font_family(FONT_MONO)
-                                                        .cursor_pointer()
-                                                        .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                                        .flex()
-                                                        .items_center()
-                                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                                            this.select_outpost(outpost_index, window, cx);
-                                                        }))
-                                                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.outpost_context_menu = Some(OutpostContextMenu {
-                                                                outpost_index,
-                                                                position: event.position,
-                                                            });
-                                                            cx.notify();
-                                                        }))
-                                                        // Bordered cell
-                                                        .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .rounded_sm()
-                                                            .border_1()
-                                                            .border_color(rgb(if is_active { theme.accent } else { theme.border }))
-                                                            .bg(rgb(theme.panel_bg))
-                                                            .px_2()
-                                                            .py_1()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .gap(px(4.))
-                                                            .when(is_active, |this| this.bg(rgb(theme.panel_active_bg)))
-                                                        // Globe icon — vertically centered
-                                                        .child(
-                                                            div()
-                                                                .flex_none()
-                                                                .w(px(18.))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .text_size(px(18.))
-                                                                .text_color(rgb(status_color))
-                                                                .child("\u{f0ac}"),
-                                                        )
-                                                        // Two-line text column
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .min_w_0()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .gap(px(1.))
-                                                        // Line 1: branch@host
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .child(
-                                                                    div()
-                                                                        .min_w_0()
-                                                                        .flex_1()
-                                                                        .overflow_hidden()
-                                                                        .whitespace_nowrap()
-                                                                        .text_ellipsis()
-                                                                        .text_xs()
-                                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                                        .text_color(rgb(theme.text_primary))
-                                                                        .child(format!("{}@{}", outpost.branch, outpost.hostname)),
-                                                                ),
-                                                        )
-                                                        // Line 2: outpost label
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_2()
-                                                                .child(
-                                                                    div()
-                                                                        .min_w_0()
-                                                                        .flex_1()
-                                                                        .overflow_hidden()
-                                                                        .whitespace_nowrap()
-                                                                        .text_ellipsis()
-                                                                        .text_xs()
-                                                                        .text_color(rgb(theme.text_disabled))
-                                                                        .child(outpost.label.clone()),
-                                                                ),
-                                                        )
-                                                        )
-                                                        )
-                                                }),
-                                                        ),
-                                                )
-                                            })
+                                            this.child(self.render_repository_worktree_sidebar(
+                                                repository_index,
+                                                &repository,
+                                                &repo_worktrees,
+                                                &repo_outposts,
+                                                selection_epoch,
+                                                compact_sidebar,
+                                                cx,
+                                            ))
                                         },
                                     )
                                     .when(
@@ -1635,6 +1043,800 @@ impl ArborWindow {
             )
     }
 
+    fn build_sidebar_order_for_group(&self, group_key: &str, repo_root: &Path) -> Vec<SidebarItemId> {
+        let worktree_ids: Vec<SidebarItemId> = self
+            .worktrees
+            .iter()
+            .filter(|worktree| worktree.group_key == group_key)
+            .map(|worktree| SidebarItemId::Worktree(worktree.path.clone()))
+            .collect();
+        let outpost_ids: Vec<SidebarItemId> = self
+            .outposts
+            .iter()
+            .filter(|outpost| outpost.repo_root == repo_root)
+            .map(|outpost| SidebarItemId::Outpost(outpost.outpost_id.clone()))
+            .collect();
+
+        normalized_sidebar_order(
+            self.sidebar_order.get(group_key).map(Vec::as_slice),
+            worktree_ids,
+            outpost_ids,
+        )
+    }
+
+    fn handle_sidebar_item_drop(
+        &mut self,
+        source_id: &SidebarItemId,
+        insert_before: usize,
+        group_key: &str,
+        repo_root: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        let items = self.build_sidebar_order_for_group(group_key, repo_root);
+        let Some(reordered) = reordered_sidebar_items(&items, source_id, insert_before) else {
+            return;
+        };
+
+        self.sidebar_order.insert(group_key.to_owned(), reordered);
+        self.sync_sidebar_order_store(cx);
+        cx.notify();
+    }
+
+    fn render_repository_worktree_sidebar(
+        &mut self,
+        repository_index: usize,
+        repository: &RepositorySummary,
+        repo_worktrees: &[(usize, WorktreeSummary)],
+        repo_outposts: &[(usize, OutpostSummary)],
+        selection_epoch: usize,
+        compact_sidebar: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let group_key = repository.group_key.clone();
+        let repo_root = repository.root.clone();
+        let worktree_map: HashMap<PathBuf, (usize, WorktreeSummary)> = repo_worktrees
+            .iter()
+            .cloned()
+            .map(|(index, worktree)| (worktree.path.clone(), (index, worktree)))
+            .collect();
+        let outpost_map: HashMap<String, (usize, OutpostSummary)> = repo_outposts
+            .iter()
+            .cloned()
+            .map(|(index, outpost)| (outpost.outpost_id.clone(), (index, outpost)))
+            .collect();
+        let sidebar_order = self.build_sidebar_order_for_group(&group_key, &repo_root);
+        let item_count = sidebar_order.len();
+        let mut elements: Vec<AnyElement> = Vec::with_capacity(item_count.saturating_mul(2) + 1);
+
+        for (slot, item_id) in sidebar_order.iter().cloned().enumerate() {
+            elements.push(
+                self.render_repository_sidebar_drop_zone(
+                    repository_index,
+                    slot,
+                    group_key.clone(),
+                    repo_root.clone(),
+                    cx,
+                )
+                .into_any_element(),
+            );
+
+            match item_id {
+                SidebarItemId::Worktree(path) => {
+                    let Some((index, worktree)) = worktree_map.get(&path).cloned() else {
+                        continue;
+                    };
+                    elements.push(
+                        self.render_repository_worktree_row(
+                            slot,
+                            group_key.as_str(),
+                            repo_root.as_path(),
+                            index,
+                            worktree,
+                            selection_epoch,
+                            compact_sidebar,
+                            cx,
+                        ),
+                    );
+                },
+                SidebarItemId::Outpost(outpost_id) => {
+                    let Some((index, outpost)) = outpost_map.get(&outpost_id).cloned() else {
+                        continue;
+                    };
+                    elements.push(
+                        self.render_repository_outpost_row(
+                            slot,
+                            group_key.as_str(),
+                            repo_root.as_path(),
+                            index,
+                            outpost,
+                            cx,
+                        ),
+                    );
+                },
+            }
+        }
+
+        elements.push(
+            self.render_repository_sidebar_drop_zone(
+                repository_index,
+                item_count,
+                group_key,
+                repo_root,
+                cx,
+            )
+            .into_any_element(),
+        );
+
+        div().flex().flex_col().children(elements)
+    }
+
+    fn render_repository_sidebar_drop_zone(
+        &self,
+        repository_index: usize,
+        slot: usize,
+        group_key: String,
+        repo_root: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = self.theme();
+        let can_drop_group_key = group_key.clone();
+        let drop_group_key = group_key.clone();
+        div()
+            .id(ElementId::Name(
+                format!("sidebar-drop-zone-{repository_index}-{slot}").into(),
+            ))
+            .h(px(6.))
+            .mx(px(4.))
+            .rounded_sm()
+            .can_drop(move |value, _, _| {
+                value
+                    .downcast_ref::<DraggedSidebarItem>()
+                    .is_some_and(|dragged| dragged.group_key == can_drop_group_key)
+            })
+            .drag_over::<DraggedSidebarItem>({
+                let accent = theme.accent;
+                move |style, _, _, _| style.bg(rgb(accent)).h(px(3.)).my(px(1.5))
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedSidebarItem, _, cx| {
+                if dragged.group_key == drop_group_key {
+                    this.handle_sidebar_item_drop(
+                        &dragged.item_id,
+                        slot,
+                        &drop_group_key,
+                        &repo_root,
+                        cx,
+                    );
+                }
+            }))
+    }
+
+    fn render_repository_worktree_row(
+        &self,
+        slot: usize,
+        group_key: &str,
+        repo_root: &Path,
+        index: usize,
+        worktree: WorktreeSummary,
+        selection_epoch: usize,
+        compact_sidebar: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme();
+        let is_active = self.active_worktree_index == Some(index);
+        let diff_summary = worktree.diff_summary;
+        let show_pr_loading_indicator = should_show_worktree_pr_loading_indicator(&worktree);
+        let pr_number = worktree.pr_number;
+        let pr_url = worktree.pr_url.clone();
+        let is_merged_pr = worktree
+            .pr_details
+            .as_ref()
+            .is_some_and(|pr| pr.state == github_service::PrState::Merged);
+        let pr_badge_color = if is_merged_pr {
+            0xbb9af7_u32
+        } else {
+            theme.accent
+        };
+        let branch_divergence = worktree.branch_divergence;
+        let pr_details = worktree.pr_details.clone();
+        let is_stuck = worktree.stuck_turn_count >= 2;
+        let is_primary = worktree.is_primary_checkout;
+        let attention = worktree_attention_indicator(&worktree);
+        let activity_sparkline = worktree_activity_sparkline(&worktree);
+        let detected_ports = worktree.detected_ports.clone();
+        let agent_dot_color = match worktree.agent_state {
+            Some(AgentState::Working) => Some(0xe5c07b_u32),
+            Some(AgentState::Waiting) => Some(0x61afef_u32),
+            None => None,
+        };
+        let drag_item_id = SidebarItemId::Worktree(worktree.path.clone());
+        let drag_group_key = group_key.to_owned();
+        let drop_group_key = group_key.to_owned();
+        let drop_repo_root = repo_root.to_path_buf();
+        let drag_label = worktree.branch.clone();
+        let drag_icon = worktree.checkout_kind.icon().to_owned();
+        let can_drop_group_key = drop_group_key.clone();
+
+        let row = div()
+            .id(("worktree-row", index))
+            .font_family(FONT_MONO)
+            .cursor_pointer()
+            .rounded_sm()
+            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+            .flex()
+            .items_center()
+            .on_drag(
+                DraggedSidebarItem {
+                    item_id: drag_item_id,
+                    group_key: drag_group_key,
+                    label: drag_label,
+                    icon: drag_icon,
+                    icon_color: theme.text_muted,
+                    bg_color: theme.panel_active_bg,
+                    border_color: theme.accent,
+                    text_color: theme.text_primary,
+                },
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| dragged.clone())
+                },
+            )
+            .can_drop(move |value, _, _| {
+                value
+                    .downcast_ref::<DraggedSidebarItem>()
+                    .is_some_and(|dragged| dragged.group_key == can_drop_group_key)
+            })
+            .drag_over::<DraggedSidebarItem>({
+                let accent = theme.accent;
+                move |style, _, _, _| style.border_color(rgb(accent)).border_t_2()
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedSidebarItem, _, cx| {
+                if dragged.group_key == drop_group_key {
+                    this.handle_sidebar_item_drop(
+                        &dragged.item_id,
+                        slot,
+                        &drop_group_key,
+                        &drop_repo_root,
+                        cx,
+                    );
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+                this.update_worktree_hover_mouse_position(event.position);
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_worktree(index, window, cx)
+            }))
+            .when(
+                !is_primary || worktree.checkout_kind == CheckoutKind::DiscreteClone,
+                |this| {
+                    this.on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.worktree_context_menu = Some(WorktreeContextMenu {
+                                worktree_index: index,
+                                position: event.position,
+                            });
+                            this.worktree_hover_popover = None;
+                            this._hover_show_task = None;
+                            cx.notify();
+                        }),
+                    )
+                },
+            )
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                this.update_worktree_hover_mouse_position(window.mouse_position());
+                if *hovered {
+                    let mouse_position = window.mouse_position();
+                    this.schedule_worktree_hover_popover_show(index, mouse_position.y, cx);
+                } else if this
+                    .worktree_hover_popover
+                    .as_ref()
+                    .is_some_and(|popover| popover.worktree_index == index)
+                {
+                    this.schedule_worktree_hover_popover_dismiss(index, cx);
+                } else {
+                    this.cancel_worktree_hover_popover_show();
+                }
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(if is_active {
+                        theme.accent
+                    } else {
+                        theme.border
+                    }))
+                    .bg(rgb(theme.panel_bg))
+                    .px_2()
+                    .py(px(if compact_sidebar { 4. } else { 6. }))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                    .when(is_active, |this| {
+                        this.bg(rgb(theme.panel_active_bg))
+                            .border_color(rgb(theme.accent))
+                    })
+                    .when(is_merged_pr && !is_active, |this| this.opacity(0.72))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if show_pr_loading_indicator {
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.accent))
+                                    .child(loading_spinner_frame(self.loading_animation_frame))
+                            } else {
+                                div()
+                                    .text_size(px(16.))
+                                    .text_color(rgb(theme.text_muted))
+                                    .child(worktree.checkout_kind.icon())
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .when_some(agent_dot_color, |this, color| {
+                                        this.child(
+                                            div()
+                                                .flex_none()
+                                                .size(px(6.))
+                                                .rounded_full()
+                                                .bg(rgb(color)),
+                                        )
+                                    })
+                                    .when(is_stuck, |this| {
+                                        this.child(
+                                            div()
+                                                .flex_none()
+                                                .text_xs()
+                                                .text_color(rgb(0xeb6f92))
+                                                .child("\u{f071}"),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(theme.text_primary))
+                                            .child(if compact_sidebar {
+                                                format!("{} · {}", worktree.label, worktree.branch)
+                                            } else {
+                                                worktree.branch.clone()
+                                            }),
+                                    )
+                                    .child({
+                                        let summary = diff_summary.unwrap_or_default();
+                                        let show_diff_summary =
+                                            summary.additions > 0 || summary.deletions > 0;
+                                        let mut right = div()
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1();
+
+                                        if compact_sidebar {
+                                            right = right.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(attention.color))
+                                                    .child(attention.short_label),
+                                            );
+                                        }
+
+                                        if self.worktree_stats_loading
+                                            && diff_summary.is_none()
+                                            && !compact_sidebar
+                                        {
+                                            right = right.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme.text_muted))
+                                                    .child("..."),
+                                            );
+                                        } else if show_diff_summary && !compact_sidebar {
+                                            if summary.additions > 0 {
+                                                right = right.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x72d69c))
+                                                        .child(format!("+{}", summary.additions)),
+                                                );
+                                            }
+                                            if summary.deletions > 0 {
+                                                right = right.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0xeb6f92))
+                                                        .child(format!("-{}", summary.deletions)),
+                                                );
+                                            }
+                                        }
+
+                                        if let Some(activity_ms) = worktree.last_activity_unix_ms {
+                                            right = right.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme.text_disabled))
+                                                    .child(format_relative_time(activity_ms)),
+                                            );
+                                        }
+
+                                        if let Some(divergence) = branch_divergence
+                                            && !compact_sidebar
+                                        {
+                                            if divergence.ahead > 0 {
+                                                right = right.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x72d69c))
+                                                        .child(format!("\u{2191}{}", divergence.ahead)),
+                                                );
+                                            }
+                                            if divergence.behind > 0 {
+                                                right = right.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0xe5c07b))
+                                                        .child(format!("\u{2193}{}", divergence.behind)),
+                                                );
+                                            }
+                                        }
+
+                                        right
+                                    }),
+                            )
+                            .when(!compact_sidebar, |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .text_xs()
+                                                .text_color(rgb(theme.text_disabled))
+                                                .child({
+                                                    let task_or_label = worktree
+                                                        .agent_task
+                                                        .clone()
+                                                        .unwrap_or_else(|| worktree.label.clone());
+                                                    if activity_sparkline.is_empty() {
+                                                        format!("{} · {}", attention.label, task_or_label)
+                                                    } else {
+                                                        format!(
+                                                            "{} {} · {}",
+                                                            attention.label, activity_sparkline, task_or_label
+                                                        )
+                                                    }
+                                                }),
+                                        )
+                                        .when_some(pr_details.clone(), |this, pr| {
+                                            let (checks_icon, checks_color) = match pr.checks_status {
+                                                github_service::CheckStatus::Success => ("\u{f00c}", 0x72d69c_u32),
+                                                github_service::CheckStatus::Failure => ("\u{f00d}", 0xeb6f92_u32),
+                                                github_service::CheckStatus::Pending => ("\u{f192}", 0xe5c07b_u32),
+                                            };
+                                            let (review_icon, _, review_color) =
+                                                review_status_presentation(pr.review_decision);
+
+                                            let mut badges = this
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(rgb(checks_color))
+                                                        .child(checks_icon),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(rgb(review_color))
+                                                        .child(review_icon),
+                                                );
+
+                                            if pr.additions > 0 {
+                                                badges = badges.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x72d69c))
+                                                        .child(format!("+{}", pr.additions)),
+                                                );
+                                            }
+                                            if pr.deletions > 0 {
+                                                badges = badges.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(rgb(0xeb6f92))
+                                                        .child(format!("-{}", pr.deletions)),
+                                                );
+                                            }
+
+                                            let mut badges = badges;
+                                            for port in detected_ports.iter().take(2) {
+                                                let port_url = worktree_port_url(port);
+                                                let port_id =
+                                                    format!("worktree-port-link-{index}-{}", port.port);
+                                                badges = badges.child(
+                                                    div()
+                                                        .id(ElementId::Name(port_id.into()))
+                                                        .cursor_pointer()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x72d69c))
+                                                        .hover(|this| {
+                                                            this.text_color(rgb(theme.text_primary))
+                                                        })
+                                                        .child(worktree_port_badge_text(port))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.open_external_url(&port_url, cx);
+                                                                cx.stop_propagation();
+                                                            },
+                                                        )),
+                                                );
+                                            }
+
+                                            badges
+                                        })
+                                        .when_some(pr_number, |this, pr_num| {
+                                            let pr_text = format!("#{pr_num}");
+                                            if let Some(pr_url) = pr_url.clone() {
+                                                this.child(
+                                                    div()
+                                                        .id(("worktree-pr-link", index))
+                                                        .cursor_pointer()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(rgb(pr_badge_color))
+                                                        .hover(|this| {
+                                                            this.text_color(rgb(theme.text_primary))
+                                                        })
+                                                        .child(pr_text)
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.open_external_url(&pr_url, cx);
+                                                            cx.stop_propagation();
+                                                        })),
+                                                )
+                                            } else {
+                                                this.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(rgb(pr_badge_color))
+                                                        .child(pr_text),
+                                                )
+                                            }
+                                        })
+                                        .when(
+                                            pr_details.is_none() && !detected_ports.is_empty(),
+                                            |this| {
+                                                detected_ports.iter().take(2).fold(this, |this, port| {
+                                                    let port_url = worktree_port_url(port);
+                                                    let port_id = format!(
+                                                        "worktree-port-link-{index}-{}",
+                                                        port.port
+                                                    );
+                                                    this.child(
+                                                        div()
+                                                            .id(ElementId::Name(port_id.into()))
+                                                            .cursor_pointer()
+                                                            .flex_none()
+                                                            .text_xs()
+                                                            .text_color(rgb(0x72d69c))
+                                                            .hover(|this| {
+                                                                this.text_color(rgb(theme.text_primary))
+                                                            })
+                                                            .child(worktree_port_badge_text(port))
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.open_external_url(&port_url, cx);
+                                                                    cx.stop_propagation();
+                                                                },
+                                                            )),
+                                                    )
+                                                })
+                                            },
+                                        ),
+                                )
+                            }),
+                    ),
+            );
+
+        if is_active {
+            row.with_animation(
+                ("worktree-select", selection_epoch),
+                Animation::new(Duration::from_millis(150)).with_easing(ease_in_out),
+                |el, delta| el.opacity(0.8 + 0.2 * delta),
+            )
+            .into_any_element()
+        } else {
+            row.opacity(0.8).into_any_element()
+        }
+    }
+
+    fn render_repository_outpost_row(
+        &self,
+        slot: usize,
+        group_key: &str,
+        repo_root: &Path,
+        outpost_index: usize,
+        outpost: OutpostSummary,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme();
+        let is_active = self.active_outpost_index == Some(outpost_index);
+        let status_color = match outpost.status {
+            arbor_core::outpost::OutpostStatus::Available => theme.accent,
+            arbor_core::outpost::OutpostStatus::Unreachable => 0xeb6f92,
+            arbor_core::outpost::OutpostStatus::NotCloned
+            | arbor_core::outpost::OutpostStatus::Provisioning => theme.text_muted,
+        };
+        let drag_item_id = SidebarItemId::Outpost(outpost.outpost_id.clone());
+        let drag_group_key = group_key.to_owned();
+        let drop_group_key = group_key.to_owned();
+        let drop_repo_root = repo_root.to_path_buf();
+        let drag_label = format!("{}@{}", outpost.branch, outpost.hostname);
+        let can_drop_group_key = drop_group_key.clone();
+
+        div()
+            .id(("outpost-row", outpost_index))
+            .font_family(FONT_MONO)
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+            .flex()
+            .items_center()
+            .on_drag(
+                DraggedSidebarItem {
+                    item_id: drag_item_id,
+                    group_key: drag_group_key,
+                    label: drag_label,
+                    icon: "\u{f0ac}".to_owned(),
+                    icon_color: status_color,
+                    bg_color: theme.panel_active_bg,
+                    border_color: theme.accent,
+                    text_color: theme.text_primary,
+                },
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| dragged.clone())
+                },
+            )
+            .can_drop(move |value, _, _| {
+                value
+                    .downcast_ref::<DraggedSidebarItem>()
+                    .is_some_and(|dragged| dragged.group_key == can_drop_group_key)
+            })
+            .drag_over::<DraggedSidebarItem>({
+                let accent = theme.accent;
+                move |style, _, _, _| style.border_color(rgb(accent)).border_t_2()
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedSidebarItem, _, cx| {
+                if dragged.group_key == drop_group_key {
+                    this.handle_sidebar_item_drop(
+                        &dragged.item_id,
+                        slot,
+                        &drop_group_key,
+                        &drop_repo_root,
+                        cx,
+                    );
+                }
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_outpost(outpost_index, window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.outpost_context_menu = Some(OutpostContextMenu {
+                        outpost_index,
+                        position: event.position,
+                    });
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(if is_active {
+                        theme.accent
+                    } else {
+                        theme.border
+                    }))
+                    .bg(rgb(theme.panel_bg))
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .when(is_active, |this| this.bg(rgb(theme.panel_active_bg)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(18.))
+                            .text_color(rgb(status_color))
+                            .child("\u{f0ac}"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .child(
+                                div().flex().items_center().child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(theme.text_primary))
+                                        .child(format!("{}@{}", outpost.branch, outpost.hostname)),
+                                ),
+                            )
+                            .child(
+                                div().flex().items_center().gap_2().child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_xs()
+                                        .text_color(rgb(theme.text_disabled))
+                                        .child(outpost.label.clone()),
+                                ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn repository_sidebar_tab_for_group(&self, group_key: &str) -> RepositorySidebarTab {
         self.repository_sidebar_tabs
             .get(group_key)
@@ -1910,12 +2112,14 @@ impl ArborWindow {
                     .child(
                         div()
                             .min_w_0()
+                            .w_full()
                             .flex()
                             .flex_1()
                             .flex_col()
                             .gap(px(6.))
                             .child(
                                 div()
+                                    .w_full()
                                     .flex()
                                     .items_start()
                                     .justify_between()
@@ -1923,6 +2127,7 @@ impl ArborWindow {
                                     .child(
                                         div()
                                             .min_w_0()
+                                            .flex_1()
                                             .flex()
                                             .flex_col()
                                             .gap(px(4.))
@@ -1937,6 +2142,7 @@ impl ArborWindow {
                                                                 .font_weight(
                                                                     FontWeight::SEMIBOLD,
                                                                 )
+                                                                .whitespace_nowrap()
                                                                 .text_color(rgb(theme.accent))
                                                                 .hover(|this| {
                                                                     this.text_color(rgb(
@@ -1964,6 +2170,7 @@ impl ArborWindow {
                                                             .font_weight(
                                                                 FontWeight::SEMIBOLD,
                                                             )
+                                                            .whitespace_nowrap()
                                                             .text_color(rgb(theme.accent))
                                                             .child(issue.display_id.clone())
                                                     }),
@@ -1971,6 +2178,10 @@ impl ArborWindow {
                                             .child(
                                                 div()
                                                     .min_w_0()
+                                                    .w_full()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
                                                     .text_sm()
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(rgb(theme.text_primary))
@@ -1979,6 +2190,7 @@ impl ArborWindow {
                                     )
                                     .child(
                                         div()
+                                            .flex_none()
                                             .rounded_full()
                                             .border_1()
                                             .border_color(rgb(issue_status_color))
@@ -2828,6 +3040,54 @@ impl ArborWindow {
                 .child(card),
         )
     }
+}
+
+fn normalized_sidebar_order(
+    saved: Option<&[SidebarItemId]>,
+    worktree_ids: Vec<SidebarItemId>,
+    outpost_ids: Vec<SidebarItemId>,
+) -> Vec<SidebarItemId> {
+    let all_current: HashSet<_> = worktree_ids.iter().chain(&outpost_ids).cloned().collect();
+
+    if let Some(saved) = saved {
+        let mut ordered: Vec<SidebarItemId> = saved
+            .iter()
+            .filter(|id| all_current.contains(id))
+            .cloned()
+            .collect();
+        let ordered_set: HashSet<_> = ordered.iter().cloned().collect();
+        for id in worktree_ids.into_iter().chain(outpost_ids) {
+            if !ordered_set.contains(&id) {
+                ordered.push(id);
+            }
+        }
+        ordered
+    } else {
+        worktree_ids.into_iter().chain(outpost_ids).collect()
+    }
+}
+
+fn reordered_sidebar_items(
+    items: &[SidebarItemId],
+    source_id: &SidebarItemId,
+    insert_before: usize,
+) -> Option<Vec<SidebarItemId>> {
+    let mut items = items.to_vec();
+    let source_pos = items.iter().position(|id| id == source_id)?;
+    let target_pos = if insert_before > source_pos {
+        insert_before.saturating_sub(1)
+    } else {
+        insert_before
+    };
+
+    if source_pos == target_pos || source_pos + 1 == insert_before {
+        return None;
+    }
+
+    let item = items.remove(source_pos);
+    let target_pos = target_pos.min(items.len());
+    items.insert(target_pos, item);
+    Some(items)
 }
 
 fn repository_add_worktree_button<I>(theme: &ThemePalette, id: I) -> Stateful<Div>

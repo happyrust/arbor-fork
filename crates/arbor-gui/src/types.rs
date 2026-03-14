@@ -7,6 +7,61 @@ pub(crate) enum SidebarItemId {
     Outpost(String),
 }
 
+/// Payload carried while dragging a sidebar worktree or outpost row.
+#[derive(Debug, Clone)]
+pub(crate) struct DraggedSidebarItem {
+    pub(crate) item_id: SidebarItemId,
+    pub(crate) group_key: String,
+    pub(crate) label: String,
+    pub(crate) icon: String,
+    pub(crate) icon_color: u32,
+    pub(crate) bg_color: u32,
+    pub(crate) border_color: u32,
+    pub(crate) text_color: u32,
+}
+
+impl Render for DraggedSidebarItem {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(220.))
+            .font_family(FONT_MONO)
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(self.border_color))
+            .bg(rgb(self.bg_color))
+            .px_2()
+            .py_1()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .opacity(0.9)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(16.))
+                    .text_color(rgb(self.icon_color))
+                    .child(self.icon.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(self.text_color))
+                    .child(self.label.clone()),
+            )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum RepositorySidebarTab {
     #[default]
@@ -1862,6 +1917,7 @@ struct ArborWindow {
     right_pane_search: String,
     right_pane_search_cursor: usize,
     right_pane_search_active: bool,
+    sidebar_order: HashMap<String, Vec<SidebarItemId>>,
     repository_sidebar_tabs: HashMap<String, RepositorySidebarTab>,
     issue_lists: HashMap<IssueTarget, IssueListState>,
     worktree_notes_lines: Vec<String>,

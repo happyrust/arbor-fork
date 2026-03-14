@@ -190,6 +190,7 @@ impl ArborWindow {
                         ThemeKind::One
                     },
                 };
+                let startup_sidebar_order = startup_ui_state.sidebar_order.clone();
                 let repository_sidebar_tabs = startup_ui_state.repository_sidebar_tabs.clone();
                 let configured_embedded_shell = loaded_config.config.embedded_shell.clone();
                 let notifications_enabled = loaded_config.config.notifications.unwrap_or(true);
@@ -355,6 +356,7 @@ impl ArborWindow {
                     right_pane_search: String::new(),
                     right_pane_search_cursor: 0,
                     right_pane_search_active: false,
+                    sidebar_order: startup_sidebar_order,
                     repository_sidebar_tabs,
                     issue_lists: HashMap::new(),
                     worktree_notes_lines: vec![String::new()],
@@ -613,6 +615,7 @@ impl ArborWindow {
                 ThemeKind::One
             },
         };
+        let startup_sidebar_order = startup_ui_state.sidebar_order.clone();
         let repository_sidebar_tabs = startup_ui_state.repository_sidebar_tabs.clone();
         let configured_embedded_shell = loaded_config.config.embedded_shell.clone();
         let notifications_enabled = loaded_config.config.notifications.unwrap_or(true);
@@ -782,6 +785,7 @@ impl ArborWindow {
             right_pane_search: String::new(),
             right_pane_search_cursor: 0,
             right_pane_search_active: false,
+            sidebar_order: startup_sidebar_order,
             repository_sidebar_tabs,
             issue_lists: HashMap::new(),
             worktree_notes_lines: vec![String::new()],
@@ -8879,6 +8883,59 @@ mod tests {
         };
         assert!(crate::persisted_logs_tab_open(&state));
         assert!(crate::persisted_logs_tab_active(&state));
+    }
+
+    #[test]
+    fn normalized_sidebar_order_keeps_saved_items_and_appends_new_ones() {
+        let saved = vec![
+            crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+        ];
+        let worktrees = vec![
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+        ];
+        let outposts = vec![crate::SidebarItemId::Outpost("outpost-1".to_owned())];
+
+        assert_eq!(
+            crate::normalized_sidebar_order(Some(saved.as_slice()), worktrees, outposts),
+            vec![
+                crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+                crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+                crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn reordered_sidebar_items_moves_dragged_item_to_requested_slot() {
+        let items = vec![
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+            crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+        ];
+
+        assert_eq!(
+            crate::reordered_sidebar_items(
+                &items,
+                &crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+                0,
+            ),
+            Some(vec![
+                crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+                crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+                crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+            ])
+        );
+
+        assert_eq!(
+            crate::reordered_sidebar_items(
+                &items,
+                &crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+                1,
+            ),
+            None
+        );
     }
 
     #[test]
