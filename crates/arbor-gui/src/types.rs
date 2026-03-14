@@ -1450,6 +1450,7 @@ enum CreateReviewPrField {
 
 #[derive(Debug, Clone)]
 struct CreateModal {
+    instance_id: u64,
     tab: CreateModalTab,
     // Worktree fields
     repository_path: String,
@@ -1809,6 +1810,7 @@ struct ArborWindow {
     github_auth_in_progress: bool,
     github_auth_copy_feedback_active: bool,
     github_auth_copy_feedback_generation: u64,
+    next_create_modal_instance_id: u64,
     config_last_modified: Option<SystemTime>,
     repositories: Vec<RepositorySummary>,
     active_repository_index: Option<usize>,
@@ -1821,6 +1823,7 @@ struct ArborWindow {
     loading_animation_frame: usize,
     expanded_pr_checks_worktree: Option<PathBuf>,
     active_worktree_index: Option<usize>,
+    pending_local_worktree_selection: Option<PathBuf>,
     worktree_selection_epoch: usize,
     changed_files: Vec<ChangedFile>,
     selected_changed_file: Option<PathBuf>,

@@ -236,6 +236,7 @@ impl ArborWindow {
                     github_auth_in_progress: false,
                     github_auth_copy_feedback_active: false,
                     github_auth_copy_feedback_generation: 0,
+                    next_create_modal_instance_id: 1,
                     config_last_modified,
                     repositories,
                     active_repository_index,
@@ -252,6 +253,7 @@ impl ArborWindow {
                     loading_animation_frame: 0,
                     expanded_pr_checks_worktree: None,
                     active_worktree_index: None,
+                    pending_local_worktree_selection: None,
                     worktree_selection_epoch: 0,
                     changed_files: Vec::new(),
                     selected_changed_file: None,
@@ -638,6 +640,7 @@ impl ArborWindow {
             github_auth_in_progress: false,
             github_auth_copy_feedback_active: false,
             github_auth_copy_feedback_generation: 0,
+            next_create_modal_instance_id: 1,
             config_last_modified,
             repositories,
             active_repository_index,
@@ -654,6 +657,7 @@ impl ArborWindow {
             loading_animation_frame: 0,
             expanded_pr_checks_worktree: None,
             active_worktree_index: None,
+            pending_local_worktree_selection: None,
             worktree_selection_epoch: 0,
             changed_files: Vec::new(),
             selected_changed_file: None,
@@ -2006,14 +2010,11 @@ impl ArborWindow {
         mode: WorktreeInventoryRefreshMode,
     ) -> WorktreeInventoryRefreshResult {
         let queued_ui_state = self.queued_ui_state_base();
-        let previous_local_selection = self
-            .selected_local_worktree_path()
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                persisted_sidebar_selection_worktree_path(
-                    queued_ui_state.selected_sidebar_selection.as_ref(),
-                )
-            });
+        let previous_local_selection = refresh_worktree_previous_local_selection(
+            self.pending_local_worktree_selection.as_deref(),
+            self.selected_local_worktree_path(),
+            queued_ui_state.selected_sidebar_selection.as_ref(),
+        );
         let active_repository_group_key = self
             .active_repository_index
             .and_then(|repository_index| self.repositories.get(repository_index))
@@ -2246,6 +2247,17 @@ impl ArborWindow {
                         &this.worktrees,
                         preserve_non_local_selection,
                     );
+                    if this
+                        .pending_local_worktree_selection
+                        .as_ref()
+                        .is_some_and(|path| {
+                            this.worktrees
+                                .iter()
+                                .any(|worktree| worktree.path.as_path() == path.as_path())
+                        })
+                    {
+                        this.pending_local_worktree_selection = None;
+                    }
                     if this.right_pane_tab == RightPaneTab::FileTree
                         && this.file_tree_entries.is_empty()
                     {
@@ -6466,6 +6478,17 @@ fn persisted_sidebar_selection_worktree_path(
     }
 }
 
+fn refresh_worktree_previous_local_selection(
+    pending_local_selection: Option<&Path>,
+    current_local_selection: Option<&Path>,
+    persisted_selection: Option<&ui_state_store::PersistedSidebarSelection>,
+) -> Option<PathBuf> {
+    pending_local_selection
+        .map(Path::to_path_buf)
+        .or_else(|| current_local_selection.map(Path::to_path_buf))
+        .or_else(|| persisted_sidebar_selection_worktree_path(persisted_selection))
+}
+
 fn persisted_sidebar_selection_outpost_index(
     selection: Option<&ui_state_store::PersistedSidebarSelection>,
     outposts: &[OutpostSummary],
@@ -8865,6 +8888,23 @@ mod tests {
         assert_eq!(
             crate::persisted_sidebar_selection_outpost_index(Some(&outpost_selection), &outposts),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn refresh_worktree_previous_local_selection_prefers_pending_created_path() {
+        let persisted = ui_state_store::PersistedSidebarSelection::Worktree {
+            repo_root: "/tmp/repo".to_owned(),
+            path: "/tmp/repo/old".to_owned(),
+        };
+
+        assert_eq!(
+            crate::refresh_worktree_previous_local_selection(
+                Some(Path::new("/tmp/repo/new")),
+                Some(Path::new("/tmp/repo/current")),
+                Some(&persisted),
+            ),
+            Some(PathBuf::from("/tmp/repo/new"))
         );
     }
 

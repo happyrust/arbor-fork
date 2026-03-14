@@ -394,11 +394,6 @@ fn github_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
 fn parse_remote(remote_url: &str) -> Option<RemoteSpec> {
     let trimmed = remote_url.trim();
 
-    if let Some(rest) = trimmed.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':')?;
-        return build_remote_spec(RemoteScheme::Https, host, path, AuthorityPortMode::Strip);
-    }
-
     if let Some(rest) = trimmed.strip_prefix("ssh://") {
         let (authority, path) = rest.split_once('/')?;
         return build_remote_spec(
@@ -429,7 +424,24 @@ fn parse_remote(remote_url: &str) -> Option<RemoteSpec> {
         );
     }
 
+    if let Some((authority, path)) = parse_scp_remote(trimmed) {
+        return build_remote_spec(
+            RemoteScheme::Https,
+            authority,
+            path,
+            AuthorityPortMode::Strip,
+        );
+    }
+
     None
+}
+
+fn parse_scp_remote(remote_url: &str) -> Option<(&str, &str)> {
+    let (authority, path) = remote_url.split_once(':')?;
+    if authority.contains('/') || authority.contains("://") || !authority.contains('@') {
+        return None;
+    }
+    Some((authority, path))
 }
 
 fn build_remote_spec(
@@ -778,6 +790,15 @@ mod tests {
         );
         assert_eq!(
             parse_remote("ssh://git@gitlab.example.com:2222/group/arbor.git"),
+            Some(RemoteSpec {
+                scheme: RemoteScheme::Https,
+                host: "gitlab.example.com".to_owned(),
+                host_kind: RemoteHostKind::Other,
+                path: "group/arbor".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_remote("alice@gitlab.example.com:group/arbor.git"),
             Some(RemoteSpec {
                 scheme: RemoteScheme::Https,
                 host: "gitlab.example.com".to_owned(),

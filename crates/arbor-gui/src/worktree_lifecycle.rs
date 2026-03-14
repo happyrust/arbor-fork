@@ -1,4 +1,21 @@
 impl ArborWindow {
+    fn next_create_modal_instance_id(&mut self) -> u64 {
+        let instance_id = self.next_create_modal_instance_id;
+        self.next_create_modal_instance_id = self.next_create_modal_instance_id.wrapping_add(1);
+        instance_id
+    }
+
+    fn queue_local_worktree_selection_after_refresh(
+        &mut self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_local_worktree_selection = Some(worktree_path);
+        self.refresh_worktrees(cx);
+        self.terminal_scroll_handle.scroll_to_bottom();
+        self.focus_terminal_on_next_render = true;
+    }
+
     fn repository_for_issue_target(&self, target: &IssueTarget) -> Option<&RepositorySummary> {
         match target.daemon_target {
             ManagedDaemonTarget::Primary => self
@@ -28,6 +45,7 @@ impl ArborWindow {
             .unwrap_or_default();
         self.issue_details_modal = None;
         self.create_modal = Some(CreateModal {
+            instance_id: self.next_create_modal_instance_id(),
             tab,
             repository_path_cursor: char_count(&repository_path),
             repository_path,
@@ -95,6 +113,7 @@ impl ArborWindow {
         self.issue_details_modal = None;
 
         self.create_modal = Some(CreateModal {
+            instance_id: self.next_create_modal_instance_id(),
             tab: CreateModalTab::LocalWorktree,
             repository_path_cursor: char_count(&repository_path),
             repository_path,
@@ -142,6 +161,7 @@ impl ArborWindow {
         let repository_path = modal.repository_path.trim().to_owned();
         let worktree_name = modal.worktree_name.trim().to_owned();
         modal.managed_preview_generation = modal.managed_preview_generation.wrapping_add(1);
+        let modal_instance_id = modal.instance_id;
         let generation = modal.managed_preview_generation;
 
         if repository_path.is_empty() || worktree_name.is_empty() {
@@ -185,7 +205,7 @@ impl ArborWindow {
                 let Some(modal) = this.create_modal.as_mut() else {
                     return;
                 };
-                if modal.managed_preview_generation != generation {
+                if !managed_preview_request_matches(modal, modal_instance_id, generation) {
                     return;
                 }
 
@@ -605,21 +625,10 @@ impl ArborWindow {
                             match target {
                                 ManagedDaemonTarget::Primary => {
                                     let worktree_path = PathBuf::from(&created.path);
-                                    this.refresh_worktrees(cx);
-                                    if let Some(index) = this
-                                        .worktrees
-                                        .iter()
-                                        .position(|worktree| worktree.path == worktree_path)
-                                    {
-                                        this.active_worktree_index = Some(index);
-                                        this.sync_navigation_ui_state_store(cx);
-                                        let _ = this.reload_changed_files();
-                                        if this.ensure_selected_worktree_terminal(cx) {
-                                            this.sync_daemon_session_store(cx);
-                                        }
-                                        this.terminal_scroll_handle.scroll_to_bottom();
-                                        this.focus_terminal_on_next_render = true;
-                                    }
+                                    this.queue_local_worktree_selection_after_refresh(
+                                        worktree_path,
+                                        cx,
+                                    );
                                 },
                                 ManagedDaemonTarget::Remote(index) => {
                                     if let Some(state) = this.remote_daemon_states.get_mut(&index) {
@@ -711,21 +720,10 @@ impl ArborWindow {
                             created.branch_name
                         ));
                         this.create_modal = None;
-                        this.refresh_worktrees(cx);
-                        if let Some(index) = this
-                            .worktrees
-                            .iter()
-                            .position(|worktree| worktree.path == created.worktree_path)
-                        {
-                            this.active_worktree_index = Some(index);
-                            this.sync_navigation_ui_state_store(cx);
-                            let _ = this.reload_changed_files();
-                            if this.ensure_selected_worktree_terminal(cx) {
-                                this.sync_daemon_session_store(cx);
-                            }
-                            this.terminal_scroll_handle.scroll_to_bottom();
-                            this.focus_terminal_on_next_render = true;
-                        }
+                        this.queue_local_worktree_selection_after_refresh(
+                            created.worktree_path,
+                            cx,
+                        );
                     },
                     Err(error) => {
                         tracing::error!("worktree creation failed: {error}");
@@ -829,21 +827,10 @@ impl ArborWindow {
                         };
                         this.notice = Some(notice);
                         this.create_modal = None;
-                        this.refresh_worktrees(cx);
-                        if let Some(index) = this
-                            .worktrees
-                            .iter()
-                            .position(|worktree| worktree.path == created.worktree_path)
-                        {
-                            this.active_worktree_index = Some(index);
-                            this.sync_navigation_ui_state_store(cx);
-                            let _ = this.reload_changed_files();
-                            if this.ensure_selected_worktree_terminal(cx) {
-                                this.sync_daemon_session_store(cx);
-                            }
-                            this.terminal_scroll_handle.scroll_to_bottom();
-                            this.focus_terminal_on_next_render = true;
-                        }
+                        this.queue_local_worktree_selection_after_refresh(
+                            created.worktree_path,
+                            cx,
+                        );
                     },
                     Err(error) => {
                         tracing::error!("pull request review creation failed: {error}");
@@ -2768,9 +2755,49 @@ fn rollback_created_checkout(
     Ok(())
 }
 
+fn managed_preview_request_matches(
+    modal: &CreateModal,
+    modal_instance_id: u64,
+    generation: u64,
+) -> bool {
+    modal.instance_id == modal_instance_id && modal.managed_preview_generation == generation
+}
+
 #[cfg(test)]
 mod worktree_lifecycle_tests {
     use super::*;
+
+    fn sample_create_modal() -> CreateModal {
+        CreateModal {
+            instance_id: 7,
+            tab: CreateModalTab::LocalWorktree,
+            repository_path: "/tmp/repo".to_owned(),
+            repository_path_cursor: 9,
+            worktree_name: "issue-42".to_owned(),
+            worktree_name_cursor: 8,
+            checkout_kind: CheckoutKind::LinkedWorktree,
+            worktree_active_field: CreateWorktreeField::WorktreeName,
+            pr_reference: String::new(),
+            pr_reference_cursor: 0,
+            review_active_field: CreateReviewPrField::PullRequestReference,
+            host_index: 0,
+            host_dropdown_open: false,
+            clone_url: String::new(),
+            clone_url_cursor: 0,
+            outpost_name: String::new(),
+            outpost_name_cursor: 0,
+            outpost_active_field: CreateOutpostField::CloneUrl,
+            daemon_managed_target: Some(ManagedDaemonTarget::Primary),
+            managed_preview: None,
+            managed_preview_loading: false,
+            managed_preview_error: None,
+            managed_preview_generation: 3,
+            issue_context: None,
+            is_creating: false,
+            creating_status: None,
+            error: None,
+        }
+    }
 
     #[test]
     fn review_worktree_name_preview_prefers_explicit_name() {
@@ -2799,5 +2826,14 @@ mod worktree_lifecycle_tests {
             default_review_worktree_name(&pull_request),
             "pr-42-fix-auth-callback-race"
         );
+    }
+
+    #[test]
+    fn managed_preview_request_matches_current_modal_instance() {
+        let modal = sample_create_modal();
+
+        assert!(managed_preview_request_matches(&modal, 7, 3));
+        assert!(!managed_preview_request_matches(&modal, 8, 3));
+        assert!(!managed_preview_request_matches(&modal, 7, 4));
     }
 }
