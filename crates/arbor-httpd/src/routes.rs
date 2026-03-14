@@ -226,12 +226,6 @@ async fn collect_linked_issue_worktrees(
     state: &AppState,
     repo_root: &Path,
 ) -> Result<Vec<LinkedIssueWorktree>, String> {
-    struct IssueWorktreeData {
-        path: PathBuf,
-        branch: String,
-        last_activity_unix_ms: Option<u64>,
-    }
-
     let entries = worktree::list(repo_root).map_err(|error| {
         format!(
             "failed to list worktrees for `{}`: {error}",
@@ -245,19 +239,7 @@ async fn collect_linked_issue_worktrees(
         repo_slug
     };
 
-    let worktrees: Vec<IssueWorktreeData> = entries
-        .into_iter()
-        .filter(|entry| !paths_equivalent(entry.path.as_path(), repo_root))
-        .map(|entry| IssueWorktreeData {
-            path: entry.path.clone(),
-            branch: entry
-                .branch
-                .as_deref()
-                .map(short_branch)
-                .unwrap_or_else(|| "-".to_owned()),
-            last_activity_unix_ms: worktree::last_git_activity_ms(&entry.path),
-        })
-        .collect();
+    let worktrees = issue_worktree_data_from_entries(entries);
 
     let pr_futures: Vec<_> = worktrees
         .iter()
@@ -285,6 +267,28 @@ async fn collect_linked_issue_worktrees(
             last_activity_unix_ms: worktree.last_activity_unix_ms,
         })
         .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssueWorktreeData {
+    path: PathBuf,
+    branch: String,
+    last_activity_unix_ms: Option<u64>,
+}
+
+fn issue_worktree_data_from_entries(entries: Vec<worktree::Worktree>) -> Vec<IssueWorktreeData> {
+    entries
+        .into_iter()
+        .map(|entry| IssueWorktreeData {
+            last_activity_unix_ms: worktree::last_git_activity_ms(&entry.path),
+            branch: entry
+                .branch
+                .as_deref()
+                .map(short_branch)
+                .unwrap_or_else(|| "-".to_owned()),
+            path: entry.path,
+        })
+        .collect()
 }
 
 pub(crate) async fn list_worktrees(
@@ -2194,6 +2198,29 @@ async fn lookup_pr_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_worktree_data_from_entries_keeps_primary_checkout() {
+        let repo_root = PathBuf::from("/tmp/arbor");
+        let entries = vec![
+            worktree::Worktree {
+                path: repo_root.clone(),
+                branch: Some("refs/heads/issue-55".to_owned()),
+                ..Default::default()
+            },
+            worktree::Worktree {
+                path: repo_root.join("../issue-55-linked"),
+                branch: Some("refs/heads/issue-55-linked".to_owned()),
+                ..Default::default()
+            },
+        ];
+
+        let worktrees = issue_worktree_data_from_entries(entries);
+
+        assert_eq!(worktrees.len(), 2);
+        assert_eq!(worktrees[0].path, repo_root);
+        assert_eq!(worktrees[0].branch, "issue-55");
+    }
 
     #[test]
     fn notification_webhook_format_detects_provider_specific_urls() {
