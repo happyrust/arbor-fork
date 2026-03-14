@@ -6,6 +6,7 @@ mod connection_history;
 mod constants;
 mod github_auth_store;
 mod github_service;
+mod graphql;
 mod log_layer;
 mod mdns_browser;
 mod notifications;
@@ -49,10 +50,7 @@ use {
         net::TcpListener,
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
-        sync::{
-            Arc, Mutex, OnceLock,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::{Arc, Mutex, OnceLock, atomic::Ordering},
         time::{Duration, Instant, SystemTime},
     },
     syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet},
@@ -225,6 +223,7 @@ impl ArborWindow {
                     worktrees: Vec::new(),
                     worktree_stats_loading: false,
                     worktree_prs_loading: false,
+                    github_rate_limited_until: None,
                     expanded_pr_checks_worktree: None,
                     active_worktree_index: None,
                     worktree_selection_epoch: 0,
@@ -603,6 +602,7 @@ impl ArborWindow {
             worktrees: Vec::new(),
             worktree_stats_loading: false,
             worktree_prs_loading: false,
+            github_rate_limited_until: None,
             expanded_pr_checks_worktree: None,
             active_worktree_index: None,
             worktree_selection_epoch: 0,
@@ -779,6 +779,7 @@ impl ArborWindow {
         app.start_log_poller(cx);
         app.start_worktree_auto_refresh(cx);
         app.start_github_pr_auto_refresh(cx);
+        app.start_github_rate_limit_poller(cx);
         app.start_config_auto_refresh(cx);
         app.start_agent_activity_ws(cx);
         app.start_daemon_log_ws(cx);
@@ -898,6 +899,36 @@ impl ArborWindow {
                 .await;
 
                 let updated = this.update(cx, |this, cx| this.refresh_worktree_pull_requests(cx));
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_github_rate_limit_poller(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_spawn(async move {
+                    std::thread::sleep(Duration::from_secs(1));
+                })
+                .await;
+
+                let updated = this.update(cx, |this, cx| {
+                    if this.github_rate_limited_until.is_none() {
+                        return;
+                    }
+
+                    if this.clear_expired_github_rate_limit() {
+                        cx.notify();
+                        return;
+                    }
+
+                    if this.github_rate_limit_remaining().is_some() {
+                        cx.notify();
+                    }
+                });
                 if updated.is_err() {
                     break;
                 }
@@ -2506,6 +2537,8 @@ impl ArborWindow {
             return;
         }
 
+        self.clear_expired_github_rate_limit();
+
         let repository_slug_by_group_key: HashMap<String, String> = self
             .repositories
             .iter()
@@ -2537,69 +2570,70 @@ impl ArborWindow {
             .collect();
         let github_token = self.github_access_token();
         let github_service = self.github_service.clone();
-
-        if tracked_branches.is_empty() {
-            let mut changed = false;
-            for worktree in &mut self.worktrees {
-                if worktree.pr_number.take().is_some()
-                    || worktree.pr_url.take().is_some()
-                    || worktree.pr_details.take().is_some()
-                {
-                    changed = true;
-                }
-            }
-            if changed {
-                cx.notify();
-            }
-            return;
-        }
-
-        self.worktree_prs_loading = true;
-        let mut cleared_untracked = false;
-        for worktree in &mut self.worktrees {
-            if tracked_paths.contains(&worktree.path) {
-                continue;
-            }
-            if worktree.pr_number.take().is_some()
-                || worktree.pr_url.take().is_some()
-                || worktree.pr_details.take().is_some()
-            {
-                cleared_untracked = true;
-            }
-        }
+        let cleared_untracked =
+            clear_pull_request_data_for_untracked_worktrees(&mut self.worktrees, &tracked_paths);
         if cleared_untracked {
             cx.notify();
         }
 
-        let pending_results = Arc::new(AtomicUsize::new(tracked_branches.len()));
-        for (path, branch, repo_slug) in tracked_branches {
-            let github_service = github_service.clone();
-            let github_token = github_token.clone();
-            let pending_results = pending_results.clone();
+        if tracked_branches.is_empty() {
+            return;
+        }
 
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_spawn(async move {
-                        Self::lookup_worktree_pull_request(
+        if let Some(remaining) = self.github_rate_limit_remaining() {
+            tracing::info!(
+                remaining_seconds = remaining.as_secs(),
+                tracked_worktrees = tracked_branches.len(),
+                "skipping GitHub PR refresh because GitHub is rate limited"
+            );
+            return;
+        }
+
+        tracing::info!(
+            tracked_worktrees = tracked_branches.len(),
+            refresh_interval_seconds = GITHUB_PR_REFRESH_INTERVAL.as_secs(),
+            "refreshing GitHub PR details"
+        );
+
+        self.worktree_prs_loading = true;
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_spawn(async move {
+                    let mut results = Vec::with_capacity(tracked_branches.len());
+
+                    for (path, branch, repo_slug) in tracked_branches {
+                        let result = Self::lookup_worktree_pull_request(
                             github_service.as_ref(),
                             github_token.as_deref(),
                             path,
                             branch,
                             repo_slug,
-                        )
-                    })
-                    .await;
+                        );
+                        let stop_due_to_rate_limit = result.4.is_some();
+                        results.push(result);
+                        if stop_due_to_rate_limit {
+                            break;
+                        }
+                    }
 
-                let is_last_result = pending_results.fetch_sub(1, Ordering::SeqCst) == 1;
+                    results
+                })
+                .await;
 
-                let _ = this.update(cx, |this, cx| {
-                    let (path, next_num, next_url, next_details) = result;
-                    let mut changed = false;
+            let _ = this.update(cx, |this, cx| {
+                for (path, next_num, next_url, next_details, rate_limited_until) in results {
+                    let preserve_cached_pr_data = should_preserve_cached_pr_data_on_rate_limit(
+                        next_num,
+                        next_url.as_deref(),
+                        next_details.as_ref(),
+                        rate_limited_until,
+                    );
 
                     if let Some(worktree) = this
                         .worktrees
                         .iter_mut()
                         .find(|worktree| worktree.path == path)
+                        && !preserve_cached_pr_data
                         && (worktree.pr_number != next_num
                             || worktree.pr_url != next_url
                             || worktree.pr_details != next_details)
@@ -2607,21 +2641,16 @@ impl ArborWindow {
                         worktree.pr_number = next_num;
                         worktree.pr_url = next_url;
                         worktree.pr_details = next_details;
-                        changed = true;
                     }
 
-                    if is_last_result {
-                        this.worktree_prs_loading = false;
-                        changed = true;
-                    }
+                    this.extend_github_rate_limit(rate_limited_until);
+                }
 
-                    if changed {
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
+                this.worktree_prs_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn lookup_worktree_pull_request(
@@ -2635,13 +2664,18 @@ impl ArborWindow {
         Option<u64>,
         Option<String>,
         Option<github_service::PrDetails>,
+        Option<SystemTime>,
     ) {
-        let details = repo_slug
+        let (details, rate_limited_until) = repo_slug
             .as_ref()
-            .and_then(|slug| github_service::pull_request_details(slug, &branch));
+            .map(|slug| github_service::pull_request_details(slug, &branch, github_token))
+            .map(|outcome| (outcome.details, outcome.rate_limited_until))
+            .unwrap_or((None, None));
 
         let (pr_number, pr_url) = if let Some(ref details) = details {
             (Some(details.number), Some(details.url.clone()))
+        } else if rate_limited_until.is_some() {
+            (None, None)
         } else {
             let pr_number = repo_slug.as_ref().and_then(|_| {
                 github_pr_number_for_worktree(github_service, &path, &branch, github_token)
@@ -2651,7 +2685,42 @@ impl ArborWindow {
             (pr_number, pr_url)
         };
 
-        (path, pr_number, pr_url, details)
+        (path, pr_number, pr_url, details, rate_limited_until)
+    }
+
+    fn github_rate_limit_remaining(&self) -> Option<Duration> {
+        self.github_rate_limited_until?
+            .duration_since(SystemTime::now())
+            .ok()
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn clear_expired_github_rate_limit(&mut self) -> bool {
+        if self.github_rate_limited_until.is_some() && self.github_rate_limit_remaining().is_none()
+        {
+            self.github_rate_limited_until = None;
+            return true;
+        }
+        false
+    }
+
+    fn extend_github_rate_limit(&mut self, rate_limited_until: Option<SystemTime>) -> bool {
+        let Some(rate_limited_until) = rate_limited_until else {
+            return false;
+        };
+        if rate_limited_until <= SystemTime::now() {
+            return false;
+        }
+
+        let next = match self.github_rate_limited_until {
+            Some(current) if current >= rate_limited_until => current,
+            _ => rate_limited_until,
+        };
+        if self.github_rate_limited_until == Some(next) {
+            return false;
+        }
+        self.github_rate_limited_until = Some(next);
+        true
     }
 
     fn switch_theme(&mut self, theme_kind: ThemeKind, cx: &mut Context<Self>) {
@@ -6598,6 +6667,54 @@ fn status_text(theme: ThemePalette, text: impl Into<String>) -> Div {
         .child(text.into())
 }
 
+fn format_countdown(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes:02}mn {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}mn {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn should_preserve_cached_pr_data_on_rate_limit(
+    next_num: Option<u64>,
+    next_url: Option<&str>,
+    next_details: Option<&github_service::PrDetails>,
+    rate_limited_until: Option<SystemTime>,
+) -> bool {
+    rate_limited_until.is_some()
+        && next_num.is_none()
+        && next_url.is_none()
+        && next_details.is_none()
+}
+
+fn clear_pull_request_data_for_untracked_worktrees(
+    worktrees: &mut [WorktreeSummary],
+    tracked_paths: &HashSet<PathBuf>,
+) -> bool {
+    let mut cleared = false;
+
+    for worktree in worktrees {
+        if tracked_paths.contains(&worktree.path) {
+            continue;
+        }
+        let had_pr_number = worktree.pr_number.take().is_some();
+        let had_pr_url = worktree.pr_url.take().is_some();
+        let had_pr_details = worktree.pr_details.take().is_some();
+        if had_pr_number || had_pr_url || had_pr_details {
+            cleared = true;
+        }
+    }
+
+    cleared
+}
+
 fn is_gui_editor(editor: &str) -> bool {
     let basename = Path::new(editor)
         .file_name()
@@ -8080,7 +8197,7 @@ mod tests {
         gpui::{Keystroke, point, px},
         std::{
             cell::Cell,
-            collections::HashMap,
+            collections::{HashMap, HashSet},
             env, fs,
             path::{Path, PathBuf},
             sync::{Arc, Mutex},
@@ -9344,6 +9461,116 @@ mod tests {
     fn github_token_resolution_falls_back_to_environment_token() {
         let token = resolve_github_access_token_from_sources(Some(""), Some(" env-token "));
         assert_eq!(token.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn format_countdown_uses_minute_suffix_requested_by_ui() {
+        assert_eq!(
+            crate::format_countdown(std::time::Duration::from_secs(3 * 60)),
+            "3mn 00s"
+        );
+        assert_eq!(
+            crate::format_countdown(std::time::Duration::from_secs(95)),
+            "1mn 35s"
+        );
+    }
+
+    #[test]
+    fn format_countdown_keeps_hour_component() {
+        assert_eq!(
+            crate::format_countdown(std::time::Duration::from_secs(3723)),
+            "1h 02mn 03s"
+        );
+    }
+
+    #[test]
+    fn preserve_cached_pr_data_only_when_rate_limited_without_fresh_pr_data() {
+        let pr = crate::github_service::PrDetails {
+            number: 42,
+            title: "Keep the old PR metadata".to_owned(),
+            url: "https://github.com/penso/arbor/pull/42".to_owned(),
+            state: crate::github_service::PrState::Open,
+            additions: 1,
+            deletions: 1,
+            review_decision: crate::github_service::ReviewDecision::Pending,
+            mergeable: crate::github_service::MergeableState::Mergeable,
+            merge_state_status: crate::github_service::MergeStateStatus::Clean,
+            passed_checks: 0,
+            checks_status: crate::github_service::CheckStatus::Pending,
+            checks: Vec::new(),
+        };
+
+        assert!(crate::should_preserve_cached_pr_data_on_rate_limit(
+            None,
+            None,
+            None,
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60)),
+        ));
+        assert!(!crate::should_preserve_cached_pr_data_on_rate_limit(
+            Some(pr.number),
+            Some(pr.url.as_str()),
+            Some(&pr),
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60)),
+        ));
+        assert!(!crate::should_preserve_cached_pr_data_on_rate_limit(
+            None, None, None, None,
+        ));
+    }
+
+    #[test]
+    fn clear_pull_request_data_for_untracked_worktrees_only_clears_stale_rows() {
+        let mut tracked = sample_worktree_summary();
+        tracked.pr_number = Some(7);
+        tracked.pr_url = Some("https://github.com/penso/arbor/pull/7".to_owned());
+        tracked.pr_details = Some(crate::github_service::PrDetails {
+            number: 7,
+            title: "Tracked".to_owned(),
+            url: "https://github.com/penso/arbor/pull/7".to_owned(),
+            state: crate::github_service::PrState::Open,
+            additions: 1,
+            deletions: 1,
+            review_decision: crate::github_service::ReviewDecision::Pending,
+            mergeable: crate::github_service::MergeableState::Mergeable,
+            merge_state_status: crate::github_service::MergeStateStatus::Clean,
+            passed_checks: 0,
+            checks_status: crate::github_service::CheckStatus::Pending,
+            checks: Vec::new(),
+        });
+
+        let mut stale = sample_worktree_summary();
+        stale.path = "/tmp/repo/wt-stale".into();
+        stale.label = "wt-stale".to_owned();
+        stale.branch = "main".to_owned();
+        stale.pr_number = Some(8);
+        stale.pr_url = Some("https://github.com/penso/arbor/pull/8".to_owned());
+        stale.pr_details = Some(crate::github_service::PrDetails {
+            number: 8,
+            title: "Stale".to_owned(),
+            url: "https://github.com/penso/arbor/pull/8".to_owned(),
+            state: crate::github_service::PrState::Open,
+            additions: 1,
+            deletions: 1,
+            review_decision: crate::github_service::ReviewDecision::Pending,
+            mergeable: crate::github_service::MergeableState::Mergeable,
+            merge_state_status: crate::github_service::MergeStateStatus::Clean,
+            passed_checks: 0,
+            checks_status: crate::github_service::CheckStatus::Pending,
+            checks: Vec::new(),
+        });
+
+        let tracked_path = tracked.path.clone();
+        let mut worktrees = vec![tracked, stale];
+        let tracked_paths = HashSet::from([tracked_path]);
+
+        assert!(crate::clear_pull_request_data_for_untracked_worktrees(
+            &mut worktrees,
+            &tracked_paths,
+        ));
+        assert_eq!(worktrees[0].pr_number, Some(7));
+        assert!(worktrees[0].pr_details.is_some());
+        assert_eq!(worktrees[1].pr_number, None);
+        assert_eq!(worktrees[1].pr_url, None);
+        assert_eq!(worktrees[1].pr_details, None);
     }
 
     #[test]
