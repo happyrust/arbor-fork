@@ -5299,23 +5299,7 @@ fn reconcile_worktree_agent_activity(
         let entry = derived_states
             .entry(matched_path.clone())
             .or_insert((session.state, session.updated_at_unix_ms));
-        match (entry.0, session.state) {
-            (AgentState::Waiting, AgentState::Working) => {
-                entry.1 = match (entry.1, session.updated_at_unix_ms) {
-                    (Some(left), Some(right)) => Some(left.max(right)),
-                    (left, right) => left.or(right),
-                };
-            },
-            (AgentState::Working, AgentState::Waiting) => {
-                *entry = (AgentState::Waiting, session.updated_at_unix_ms);
-            },
-            _ => {
-                entry.1 = match (entry.1, session.updated_at_unix_ms) {
-                    (Some(left), Some(right)) => Some(left.max(right)),
-                    (left, right) => left.or(right),
-                };
-            },
-        }
+        merge_agent_activity_state(entry, session.state, session.updated_at_unix_ms);
     }
 
     let mut waiting_transitions = Vec::new();
@@ -5366,6 +5350,24 @@ fn agent_waiting_transition_detected(
     next_state: Option<AgentState>,
 ) -> bool {
     previous_state == Some(AgentState::Working) && next_state == Some(AgentState::Waiting)
+}
+
+fn merge_agent_activity_state(
+    entry: &mut (AgentState, Option<u64>),
+    state: AgentState,
+    updated_at_unix_ms: Option<u64>,
+) {
+    if entry.0 == AgentState::Working && state == AgentState::Waiting {
+        entry.0 = AgentState::Waiting;
+    }
+    entry.1 = merge_agent_activity_timestamp(entry.1, updated_at_unix_ms);
+}
+
+fn merge_agent_activity_timestamp(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    match (current, next) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
 }
 
 #[derive(Clone)]
@@ -8779,6 +8781,17 @@ mod tests {
             Some(AgentState::Waiting),
             Some(AgentState::Waiting),
         ));
+    }
+
+    #[test]
+    fn merge_agent_activity_state_keeps_waiting_and_latest_timestamp() {
+        let mut merged = (AgentState::Working, Some(200));
+        crate::merge_agent_activity_state(&mut merged, AgentState::Waiting, Some(100));
+        assert_eq!(merged, (AgentState::Waiting, Some(200)));
+
+        let mut merged = (AgentState::Waiting, Some(100));
+        crate::merge_agent_activity_state(&mut merged, AgentState::Working, Some(200));
+        assert_eq!(merged, (AgentState::Waiting, Some(200)));
     }
 
     #[test]
