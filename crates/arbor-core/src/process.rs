@@ -39,6 +39,18 @@ pub fn procfile_managed_process_name_from_title(title: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+pub fn managed_process_source_and_name_from_title(title: &str) -> Option<(ProcessSource, &str)> {
+    [ProcessSource::Procfile, ProcessSource::ArborToml]
+        .into_iter()
+        .find_map(|source| {
+            title
+                .strip_prefix(managed_process_title_prefix(source))
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| (source, name))
+        })
+}
+
 fn managed_process_title_prefix(source: ProcessSource) -> &'static str {
     match source {
         ProcessSource::ArborToml => ARBOR_TOML_MANAGED_PROCESS_TITLE_PREFIX,
@@ -68,8 +80,8 @@ pub struct ProcessInfo {
 mod tests {
     use crate::process::{
         ARBOR_TOML_MANAGED_PROCESS_TITLE_PREFIX, PROCFILE_MANAGED_PROCESS_TITLE_PREFIX,
-        ProcessSource, managed_process_session_title, procfile_managed_process_name_from_title,
-        procfile_managed_process_title,
+        ProcessSource, managed_process_session_title, managed_process_source_and_name_from_title,
+        procfile_managed_process_name_from_title, procfile_managed_process_title,
     };
 
     #[test]
@@ -100,5 +112,19 @@ mod tests {
             format!("{ARBOR_TOML_MANAGED_PROCESS_TITLE_PREFIX}web")
         );
         assert_eq!(procfile_managed_process_name_from_title(&title), None);
+        assert_eq!(
+            managed_process_source_and_name_from_title(&title),
+            Some((ProcessSource::ArborToml, "web"))
+        );
+    }
+
+    #[test]
+    fn managed_process_title_parser_recognizes_procfile_titles() {
+        let title = procfile_managed_process_title("worker");
+
+        assert_eq!(
+            managed_process_source_and_name_from_title(&title),
+            Some((ProcessSource::Procfile, "worker"))
+        );
     }
 }

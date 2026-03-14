@@ -178,12 +178,13 @@ impl ArborWindow {
         self.active_terminal_by_worktree
             .insert(worktree_path.clone(), session_id);
 
-        let title = managed_process_title(&process.name);
+        let title = managed_process_title(process.source, &process.name);
         let process_id = process.id.clone();
         let process_name_for_spawn = process.name.clone();
         let process_name_for_update = process.name.clone();
         let process_command_for_spawn = process.command.clone();
         let process_command_for_update = process.command.clone();
+        let process_working_dir = process.working_dir.clone();
         self.terminals.push(TerminalSession {
             id: session_id,
             daemon_session_id: session_id.to_string(),
@@ -244,7 +245,7 @@ impl ArborWindow {
                         match daemon.create_or_attach(CreateOrAttachRequest {
                             session_id: String::new().into(),
                             workspace_id: worktree_path.display().to_string().into(),
-                            cwd: worktree_path.clone(),
+                            cwd: process_working_dir.clone(),
                             shell,
                             cols: 120,
                             rows: 35,
@@ -279,7 +280,7 @@ impl ArborWindow {
                     }
 
                     match EmbeddedTerminal::spawn_command(
-                        &worktree_path,
+                        &process_working_dir,
                         &process_command_for_spawn,
                         35,
                         120,

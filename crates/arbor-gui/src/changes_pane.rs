@@ -574,7 +574,7 @@ impl ArborWindow {
                     div()
                         .text_sm()
                         .text_color(rgb(theme.text_muted))
-                        .child("No processes yet. Procfile processes are listed here."),
+                        .child("No processes yet. Procfile and arbor.toml processes are listed here."),
                 );
         }
 
@@ -825,7 +825,11 @@ impl ArborWindow {
                 div()
                     .text_xs()
                     .text_color(rgb(theme.text_muted))
-                    .child(process.command.clone()),
+                    .child(format!(
+                        "{} · {}",
+                        managed_process_source_display_name(process.source),
+                        process.command.as_str()
+                    )),
             )
             .child(actions)
     }

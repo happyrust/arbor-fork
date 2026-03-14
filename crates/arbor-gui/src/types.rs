@@ -36,6 +36,8 @@ struct ManagedWorktreeProcess {
     id: String,
     name: String,
     command: String,
+    working_dir: PathBuf,
+    source: ProcessSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
