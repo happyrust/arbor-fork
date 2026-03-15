@@ -103,7 +103,7 @@ impl ArborWindow {
                         },
                         Err(error) => {
                             if let Some(modal) = this.commit_modal.as_mut() {
-                                modal.error = Some(error);
+                                modal.error = Some(error.to_string());
                             } else {
                                 this.notice = Some("failed to create commit".to_owned());
                             }
@@ -148,7 +148,7 @@ impl ArborWindow {
                     Ok(message) => message,
                     Err(error) => {
                         let _ = progress_tx.send_blocking(StackedGitActionProgress::Done(Err(
-                            StackedGitActionFailure::Commit(error),
+                            StackedGitActionFailure::Commit(error.to_string()),
                         )));
                         return;
                     },
@@ -163,7 +163,7 @@ impl ArborWindow {
                         let _ = progress_tx.send_blocking(StackedGitActionProgress::Done(Err(
                             StackedGitActionFailure::Push {
                                 commit_message,
-                                error,
+                                error: error.to_string(),
                             },
                         )));
                         return;
@@ -310,7 +310,7 @@ impl ArborWindow {
                             modal.error = None;
                         },
                         Err(error) => {
-                            modal.error = Some(error);
+                            modal.error = Some(error.to_string());
                         },
                     }
                 }
@@ -354,7 +354,7 @@ impl ArborWindow {
                         this.refresh_worktree_pull_requests(cx);
                     },
                     Err(error) => {
-                        this.notice = Some(error);
+                        this.notice = Some(error.to_string());
                     },
                 }
                 cx.notify();
@@ -640,7 +640,7 @@ fn generate_commit_message_with_ai(
     preset: AgentPresetKind,
     command: &str,
     execution_mode: ExecutionMode,
-) -> Result<String, String> {
+) -> Result<String, PromptError> {
     let prompt = build_commit_message_prompt(changed_files);
     run_prompt_capture(
         worktree_path,
@@ -683,53 +683,55 @@ fn run_git_commit_for_worktree(
     worktree_path: &Path,
     changed_files: &[ChangedFile],
     message: &str,
-) -> Result<String, String> {
+) -> Result<String, GitError> {
     if changed_files.is_empty() {
-        return Err("nothing to commit".to_owned());
+        return Err(GitError::Operation("nothing to commit".to_owned()));
     }
 
     let repo = git2::Repository::open(worktree_path).map_err(|error| {
-        format!(
+        GitError::Operation(format!(
             "failed to open repository at `{}`: {error}",
             worktree_path.display()
-        )
+        ))
     })?;
 
     let mut index = repo
         .index()
-        .map_err(|error| format!("failed to read index: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to read index: {error}")))?;
     index
         .add_all(["."], git2::IndexAddOption::DEFAULT, None)
-        .map_err(|error| format!("failed to stage changes: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to stage changes: {error}")))?;
     index
         .update_all(["."], None)
-        .map_err(|error| format!("failed to update index: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to update index: {error}")))?;
     index
         .write()
-        .map_err(|error| format!("failed to write index: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to write index: {error}")))?;
 
     let tree_oid = index
         .write_tree()
-        .map_err(|error| format!("failed to write tree: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to write tree: {error}")))?;
     let tree = repo
         .find_tree(tree_oid)
-        .map_err(|error| format!("failed to find tree: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to find tree: {error}")))?;
 
     if let Ok(head_commit) = repo.head().and_then(|h| h.peel_to_commit())
         && head_commit.tree_id() == tree_oid
     {
-        return Err("nothing to commit".to_owned());
+        return Err(GitError::Operation("nothing to commit".to_owned()));
     }
 
     let message = message.trim();
     if message.is_empty() {
-        return Err("commit message cannot be empty".to_owned());
+        return Err(GitError::Operation(
+            "commit message cannot be empty".to_owned(),
+        ));
     }
     let subject = message.lines().next().unwrap_or("commit");
 
     let sig = repo
         .signature()
-        .map_err(|error| format!("failed to create signature: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to create signature: {error}")))?;
 
     let parent_commits: Vec<git2::Commit<'_>> = match repo.head().and_then(|h| h.peel_to_commit()) {
         Ok(commit) => vec![commit],
@@ -738,31 +740,33 @@ fn run_git_commit_for_worktree(
     let parents: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
 
     repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
-        .map_err(|error| format!("failed to create commit: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to create commit: {error}")))?;
 
     Ok(format!("commit complete: {subject}"))
 }
 
-fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, String> {
+fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, GitError> {
     let repo = git2::Repository::open(worktree_path).map_err(|error| {
-        format!(
+        GitError::Operation(format!(
             "failed to open repository at `{}`: {error}",
             worktree_path.display()
-        )
+        ))
     })?;
 
     let head_ref = repo
         .head()
-        .map_err(|error| format!("failed to read HEAD: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to read HEAD: {error}")))?;
     let branch_name = head_ref
         .shorthand()
-        .ok_or_else(|| "cannot push detached HEAD".to_owned())?
+        .ok_or_else(|| GitError::Operation("cannot push detached HEAD".to_owned()))?
         .to_owned();
     let refspec = format!("refs/heads/{branch_name}:refs/heads/{branch_name}");
 
     let mut remote = repo
         .find_remote("origin")
-        .map_err(|error| format!("failed to find remote 'origin': {error}"))?;
+        .map_err(|error| {
+            GitError::Operation(format!("failed to find remote 'origin': {error}"))
+        })?;
 
     let mut callbacks = git2::RemoteCallbacks::new();
     callbacks.credentials(|_url, username_from_url, allowed_types| {
@@ -783,11 +787,11 @@ fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, String> {
 
     remote
         .push(&[&refspec], Some(&mut push_options))
-        .map_err(|error| format!("push failed: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("push failed: {error}")))?;
 
     let mut config = repo
         .config()
-        .map_err(|error| format!("failed to read config: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to read config: {error}")))?;
     let _ = config.set_str(&format!("branch.{branch_name}.remote"), "origin");
     let _ = config.set_str(
         &format!("branch.{branch_name}.merge"),
@@ -799,27 +803,31 @@ fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, String> {
     ))
 }
 
-fn git_branch_name_for_worktree(worktree_path: &Path) -> Result<String, String> {
+fn git_branch_name_for_worktree(worktree_path: &Path) -> Result<String, GitError> {
     let repo = gix::open(worktree_path).map_err(|error| {
-        format!(
+        GitError::Operation(format!(
             "failed to open repository at `{}`: {error}",
             worktree_path.display()
-        )
+        ))
     })?;
 
     let head_ref = repo
         .head_ref()
-        .map_err(|error| format!("failed to read HEAD: {error}"))?;
+        .map_err(|error| GitError::Operation(format!("failed to read HEAD: {error}")))?;
 
     match head_ref {
         Some(reference) => {
             let name = reference.name().shorten().to_string();
             if name.is_empty() {
-                return Err("cannot create a PR from detached HEAD".to_owned());
+                return Err(GitError::Operation(
+                    "cannot create a PR from detached HEAD".to_owned(),
+                ));
             }
             Ok(name)
         },
-        None => Err("cannot create a PR from detached HEAD".to_owned()),
+        None => Err(GitError::Operation(
+            "cannot create a PR from detached HEAD".to_owned(),
+        )),
     }
 }
 
@@ -867,7 +875,8 @@ fn run_create_pr_for_worktree(
         return Err("push the branch before creating a PR".to_owned());
     }
 
-    let branch = git_branch_name_for_worktree(worktree_path)?;
+    let branch =
+        git_branch_name_for_worktree(worktree_path).map_err(|error| error.to_string())?;
     let base_branch = git_default_base_branch(worktree_path).unwrap_or_else(|| "main".to_owned());
 
     let slug = repo_slug
@@ -889,7 +898,9 @@ fn run_create_pr_for_worktree(
         ));
     }
 
-    github_service.create_pull_request(&slug, &title, &branch, &base_branch, &token)
+    github_service
+        .create_pull_request(&slug, &title, &branch, &base_branch, &token)
+        .map_err(|error| error.to_string())
 }
 
 fn extract_first_url(text: &str) -> Option<String> {

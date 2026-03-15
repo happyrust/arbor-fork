@@ -56,21 +56,27 @@ fn github_oauth_http_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-fn github_request_device_code(client_id: &str) -> Result<GitHubDeviceCode, String> {
+fn github_request_device_code(client_id: &str) -> Result<GitHubDeviceCode, GitHubError> {
     let response = github_oauth_http_agent()
         .post(GITHUB_OAUTH_DEVICE_CODE_URL)
         .header("Accept", "application/json")
         .header("User-Agent", "Arbor")
         .send_form([("client_id", client_id), ("scope", GITHUB_OAUTH_SCOPE)])
-        .map_err(|error| format!("failed to start GitHub OAuth flow: {error}"))?;
+        .map_err(|error| {
+            GitHubError::Auth(format!("failed to start GitHub OAuth flow: {error}"))
+        })?;
 
     let status = response.status();
     let body = response
         .into_body()
         .read_to_string()
-        .map_err(|error| format!("failed to read GitHub OAuth response: {error}"))?;
+        .map_err(|error| {
+            GitHubError::Auth(format!("failed to read GitHub OAuth response: {error}"))
+        })?;
     let payload: GitHubDeviceCodeResponse = serde_json::from_str(&body)
-        .map_err(|error| format!("failed to parse GitHub OAuth response: {error}"))?;
+        .map_err(|error| {
+            GitHubError::Auth(format!("failed to parse GitHub OAuth response: {error}"))
+        })?;
 
     if !status.is_success() {
         let reason = payload
@@ -79,22 +85,30 @@ fn github_request_device_code(client_id: &str) -> Result<GitHubDeviceCode, Strin
         let description = payload
             .error_description
             .unwrap_or_else(|| "request was rejected".to_owned());
-        return Err(format!(
+        return Err(GitHubError::Auth(format!(
             "failed to start GitHub OAuth flow: {reason} ({description})"
-        ));
+        )));
     }
 
     let device_code = non_empty_trimmed_str(&payload.device_code)
         .map(str::to_owned)
-        .ok_or_else(|| "GitHub OAuth response was missing device_code".to_owned())?;
+        .ok_or_else(|| {
+            GitHubError::Auth("GitHub OAuth response was missing device_code".to_owned())
+        })?;
     let user_code = non_empty_trimmed_str(&payload.user_code)
         .map(str::to_owned)
-        .ok_or_else(|| "GitHub OAuth response was missing user_code".to_owned())?;
+        .ok_or_else(|| {
+            GitHubError::Auth("GitHub OAuth response was missing user_code".to_owned())
+        })?;
     let verification_uri = non_empty_trimmed_str(&payload.verification_uri)
         .map(str::to_owned)
-        .ok_or_else(|| "GitHub OAuth response was missing verification_uri".to_owned())?;
+        .ok_or_else(|| {
+            GitHubError::Auth("GitHub OAuth response was missing verification_uri".to_owned())
+        })?;
     let expires_in = if payload.expires_in == 0 {
-        return Err("GitHub OAuth response was missing expires_in".to_owned());
+        return Err(GitHubError::Auth(
+            "GitHub OAuth response was missing expires_in".to_owned(),
+        ));
     } else {
         payload.expires_in
     };
@@ -116,7 +130,7 @@ fn github_request_device_code(client_id: &str) -> Result<GitHubDeviceCode, Strin
 fn github_poll_device_access_token(
     client_id: &str,
     device_code: &GitHubDeviceCode,
-) -> Result<GitHubAccessToken, String> {
+) -> Result<GitHubAccessToken, GitHubError> {
     let deadline = Instant::now() + Duration::from_secs(device_code.expires_in.max(5));
     let mut poll_interval = Duration::from_secs(
         device_code
@@ -127,7 +141,9 @@ fn github_poll_device_access_token(
 
     loop {
         if Instant::now() >= deadline {
-            return Err("GitHub authorization timed out before completion".to_owned());
+            return Err(GitHubError::Auth(
+                "GitHub authorization timed out before completion".to_owned(),
+            ));
         }
 
         std::thread::sleep(poll_interval);
@@ -153,10 +169,14 @@ fn github_poll_device_access_token(
                 continue;
             },
             Some("access_denied") => {
-                return Err("GitHub authorization was denied".to_owned());
+                return Err(GitHubError::Auth(
+                    "GitHub authorization was denied".to_owned(),
+                ));
             },
             Some("expired_token") => {
-                return Err("GitHub authorization code expired".to_owned());
+                return Err(GitHubError::Auth(
+                    "GitHub authorization code expired".to_owned(),
+                ));
             },
             Some(other) => {
                 let description = payload
@@ -164,10 +184,14 @@ fn github_poll_device_access_token(
                     .as_deref()
                     .and_then(non_empty_trimmed_str)
                     .unwrap_or("request failed");
-                return Err(format!("GitHub OAuth failed: {other} ({description})"));
+                return Err(GitHubError::Auth(format!(
+                    "GitHub OAuth failed: {other} ({description})"
+                )));
             },
             None => {
-                return Err("GitHub OAuth response was missing an access token".to_owned());
+                return Err(GitHubError::Auth(
+                    "GitHub OAuth response was missing an access token".to_owned(),
+                ));
             },
         }
     }
@@ -176,7 +200,7 @@ fn github_poll_device_access_token(
 fn github_request_access_token(
     client_id: &str,
     device_code: &str,
-) -> Result<GitHubTokenResponse, String> {
+) -> Result<GitHubTokenResponse, GitHubError> {
     let response = github_oauth_http_agent()
         .post(GITHUB_OAUTH_ACCESS_TOKEN_URL)
         .header("Accept", "application/json")
@@ -186,19 +210,30 @@ fn github_request_access_token(
             ("device_code", device_code),
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ])
-        .map_err(|error| format!("failed to poll GitHub OAuth status: {error}"))?;
+        .map_err(|error| {
+            GitHubError::Auth(format!("failed to poll GitHub OAuth status: {error}"))
+        })?;
 
     let status = response.status();
     let body = response
         .into_body()
         .read_to_string()
-        .map_err(|error| format!("failed to read GitHub OAuth token response: {error}"))?;
-    let payload: GitHubTokenResponse = serde_json::from_str(&body)
-        .map_err(|error| format!("failed to parse GitHub OAuth token response: {error}"))?;
+        .map_err(|error| {
+            GitHubError::Auth(format!(
+                "failed to read GitHub OAuth token response: {error}"
+            ))
+        })?;
+    let payload: GitHubTokenResponse = serde_json::from_str(&body).map_err(|error| {
+        GitHubError::Auth(format!(
+            "failed to parse GitHub OAuth token response: {error}"
+        ))
+    })?;
 
     if status.is_success() || payload.error.is_some() || payload.access_token.is_some() {
         return Ok(payload);
     }
 
-    Err("GitHub OAuth token request failed".to_owned())
+    Err(GitHubError::Auth(
+        "GitHub OAuth token request failed".to_owned(),
+    ))
 }

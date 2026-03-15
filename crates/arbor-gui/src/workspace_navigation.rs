@@ -477,7 +477,7 @@ impl ArborWindow {
                             clear_global_daemon,
                         },
                         Err(error) => SpawnManagedProcessOutcome::Failed {
-                            error,
+                            error: error.to_string(),
                             notice: fallback_notice,
                             clear_global_daemon,
                         },
@@ -1380,7 +1380,7 @@ impl ArborWindow {
                         this.github_auth_in_progress = false;
                         this.github_auth_modal = None;
                         this.github_auth_copy_feedback_active = false;
-                        this.notice = Some(error);
+                        this.notice = Some(error.to_string());
                         cx.notify();
                     });
                     return;
@@ -1439,7 +1439,7 @@ impl ArborWindow {
                         this.refresh_worktree_pull_requests(cx);
                     },
                     Err(error) => {
-                        this.notice = Some(error);
+                        this.notice = Some(error.to_string());
                     },
                 }
                 cx.notify();
@@ -1516,8 +1516,10 @@ impl ArborWindow {
             return;
         };
 
-        let result = match action {
-            WorktreeQuickAction::OpenFinder => open_worktree_in_file_manager(&worktree_path),
+        let result: Result<String, String> = match action {
+            WorktreeQuickAction::OpenFinder => {
+                open_worktree_in_file_manager(&worktree_path).map_err(|error| error.to_string())
+            },
             WorktreeQuickAction::CopyPath => {
                 cx.write_to_clipboard(ClipboardItem::new_string(
                     worktree_path.display().to_string(),
@@ -1558,7 +1560,7 @@ impl ArborWindow {
         self.close_top_bar_worktree_quick_actions();
         self.notice = Some(match result {
             Ok(message) => message,
-            Err(error) => error,
+            Err(error) => error.to_string(),
         });
         cx.notify();
     }

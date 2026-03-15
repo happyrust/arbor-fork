@@ -2,6 +2,7 @@ pub use arbor_terminal_emulator::{
     TerminalCursor, TerminalModes, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
 };
 use {
+    crate::TerminalError,
     arbor_terminal_emulator::{
         self, TERMINAL_COLS, TERMINAL_DEFAULT_BG, TERMINAL_DEFAULT_FG, TERMINAL_ROWS,
         TerminalEmulator, TerminalSnapshot, process_terminal_bytes,
@@ -51,7 +52,7 @@ pub fn launch_backend(
     cwd: &Path,
     initial_rows: u16,
     initial_cols: u16,
-) -> Result<TerminalLaunch, String> {
+) -> Result<TerminalLaunch, TerminalError> {
     match kind {
         TerminalBackendKind::Embedded => {
             EmbeddedTerminal::spawn(cwd, initial_rows, initial_cols).map(TerminalLaunch::Embedded)
@@ -60,7 +61,7 @@ pub fn launch_backend(
 }
 
 impl EmbeddedTerminal {
-    pub fn spawn(cwd: &Path, initial_rows: u16, initial_cols: u16) -> Result<Self, String> {
+    pub fn spawn(cwd: &Path, initial_rows: u16, initial_cols: u16) -> Result<Self, TerminalError> {
         Self::spawn_with_command(cwd, initial_rows, initial_cols, None)
     }
 
@@ -69,7 +70,7 @@ impl EmbeddedTerminal {
         command: &str,
         initial_rows: u16,
         initial_cols: u16,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, TerminalError> {
         Self::spawn_with_command(cwd, initial_rows, initial_cols, Some(command))
     }
 
@@ -78,7 +79,7 @@ impl EmbeddedTerminal {
         initial_rows: u16,
         initial_cols: u16,
         command_text: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, TerminalError> {
         let rows = if initial_rows > 0 {
             initial_rows
         } else {
@@ -97,7 +98,7 @@ impl EmbeddedTerminal {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|error| format!("failed to create PTY: {error}"))?;
+            .map_err(|error| TerminalError::Pty(format!("failed to create PTY: {error}")))?;
 
         let mut command = CommandBuilder::new(default_shell());
         if let Some(command_text) = command_text {
@@ -115,21 +116,20 @@ impl EmbeddedTerminal {
             command.env("COLORTERM", "truecolor");
         }
 
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| format!("failed to spawn shell in PTY: {error}"))?;
+        let child = pair.slave.spawn_command(command).map_err(|error| {
+            TerminalError::Pty(format!("failed to spawn shell in PTY: {error}"))
+        })?;
         let root_pid = child.process_id();
         let killer = child.clone_killer();
 
         let reader = pair
             .master
             .try_clone_reader()
-            .map_err(|error| format!("failed to clone PTY reader: {error}"))?;
+            .map_err(|error| TerminalError::Pty(format!("failed to clone PTY reader: {error}")))?;
         let writer = pair
             .master
             .take_writer()
-            .map_err(|error| format!("failed to open PTY writer: {error}"))?;
+            .map_err(|error| TerminalError::Pty(format!("failed to open PTY writer: {error}")))?;
         let master = pair.master;
 
         let emulator = Arc::new(Mutex::new(TerminalEmulator::with_size(rows, cols)));
@@ -162,7 +162,7 @@ impl EmbeddedTerminal {
         })
     }
 
-    pub fn write_input(&self, bytes: &[u8]) -> Result<(), String> {
+    pub fn write_input(&self, bytes: &[u8]) -> Result<(), TerminalError> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -170,13 +170,13 @@ impl EmbeddedTerminal {
         let mut writer = self
             .writer
             .lock()
-            .map_err(|_| "failed to acquire PTY writer lock".to_owned())?;
+            .map_err(|_| TerminalError::LockPoisoned("PTY writer"))?;
         writer
             .write_all(bytes)
-            .map_err(|error| format!("failed to write to PTY: {error}"))?;
+            .map_err(|error| TerminalError::Pty(format!("failed to write to PTY: {error}")))?;
         writer
             .flush()
-            .map_err(|error| format!("failed to flush PTY writer: {error}"))
+            .map_err(|error| TerminalError::Pty(format!("failed to flush PTY writer: {error}")))
     }
 
     pub fn snapshot(&self) -> EmbeddedSnapshot {
@@ -204,7 +204,7 @@ impl EmbeddedTerminal {
         cols: u16,
         pixel_width: u16,
         pixel_height: u16,
-    ) -> Result<(), String> {
+    ) -> Result<(), TerminalError> {
         let rows = rows.max(1);
         let cols = cols.max(2);
         let pixel_width = pixel_width.max(1);
@@ -214,7 +214,7 @@ impl EmbeddedTerminal {
             let size = self
                 .size
                 .lock()
-                .map_err(|_| "failed to acquire terminal size lock".to_owned())?;
+                .map_err(|_| TerminalError::LockPoisoned("terminal size"))?;
             if *size == (rows, cols, pixel_width, pixel_height) {
                 return Ok(());
             }
@@ -224,7 +224,7 @@ impl EmbeddedTerminal {
             let mut emulator = self
                 .emulator
                 .lock()
-                .map_err(|_| "failed to acquire emulator lock for resize".to_owned())?;
+                .map_err(|_| TerminalError::LockPoisoned("emulator"))?;
             emulator.resize(rows, cols);
         }
 
@@ -232,7 +232,7 @@ impl EmbeddedTerminal {
             let master = self
                 .master
                 .lock()
-                .map_err(|_| "failed to acquire PTY master lock for resize".to_owned())?;
+                .map_err(|_| TerminalError::LockPoisoned("PTY master"))?;
             master
                 .resize(PtySize {
                     rows,
@@ -240,14 +240,14 @@ impl EmbeddedTerminal {
                     pixel_width,
                     pixel_height,
                 })
-                .map_err(|error| format!("failed to resize PTY: {error}"))?;
+                .map_err(|error| TerminalError::Pty(format!("failed to resize PTY: {error}")))?;
         }
 
         {
             let mut size = self
                 .size
                 .lock()
-                .map_err(|_| "failed to update terminal size lock".to_owned())?;
+                .map_err(|_| TerminalError::LockPoisoned("terminal size"))?;
             *size = (rows, cols, pixel_width, pixel_height);
         }
 

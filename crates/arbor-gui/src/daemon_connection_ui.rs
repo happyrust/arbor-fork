@@ -440,7 +440,7 @@ impl ArborWindow {
                         Some((local_url, local_port))
                         },
                         Err(error) => {
-                            this.notice = Some(error);
+                            this.notice = Some(error.to_string());
                             this.terminal_daemon = None;
                             this.connected_daemon_label = None;
                             cx.notify();
@@ -742,7 +742,7 @@ impl ArborWindow {
                 self.connect_to_host_modal = Some(ConnectToHostModal {
                     address_cursor: char_count(&address),
                     address,
-                    error: Some(error),
+                    error: Some(error.to_string()),
                 });
                 cx.notify();
                 return;

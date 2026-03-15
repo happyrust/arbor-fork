@@ -184,6 +184,7 @@ impl ArborWindow {
                         this.notice = Some(format!("Preset \"{name}\" {action}."));
                     },
                     Err(error) => {
+                        let error = error.to_string();
                         this.repo_presets = previous_repo_presets;
                         if let Some(m) = this.manage_repo_presets_modal.as_mut() {
                             m.error = Some(error.clone());
@@ -234,6 +235,7 @@ impl ArborWindow {
                         this.notice = Some(format!("Preset \"{name}\" removed."));
                     },
                     Err(error) => {
+                        let error = error.to_string();
                         if let Some(m) = this.manage_repo_presets_modal.as_mut() {
                             m.error = Some(error.clone());
                             m.saving = false;

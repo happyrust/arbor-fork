@@ -141,8 +141,9 @@ impl ArborWindow {
                         }
                     },
                     Err(error) => {
+                        let error = error.to_string();
                         if let Some(modal) = this.manage_hosts_modal.as_mut() {
-                            modal.error = Some(error.clone());
+                            modal.error = Some(error);
                             modal.saving = false;
                         } else {
                             this.notice = Some(error);
@@ -173,7 +174,7 @@ impl ArborWindow {
                         this.notice = Some(format!("Host \"{host_name}\" removed."));
                     },
                     Err(error) => {
-                        this.notice = Some(error);
+                        this.notice = Some(error.to_string());
                     },
                 }
                 this.finish_background_config_save(cx);

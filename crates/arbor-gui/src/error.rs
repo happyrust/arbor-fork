@@ -34,7 +34,54 @@ pub(crate) enum StoreError {
         path: String,
         source: toml_edit::TomlError,
     },
-    #[allow(dead_code)]
     #[error("{0}")]
     Other(String),
+}
+
+/// Errors from embedded terminal PTY operations.
+#[derive(Debug, Error)]
+pub(crate) enum TerminalError {
+    #[error("{0}")]
+    Pty(String),
+    #[error("{0}")]
+    LockPoisoned(&'static str),
+}
+
+/// Errors from connection address parsing and tunnel setup.
+#[derive(Debug, Error)]
+pub(crate) enum ConnectionError {
+    #[error("{0}")]
+    Parse(String),
+    #[error("{0}")]
+    Io(String),
+}
+
+/// Errors from GitHub API and OAuth operations.
+#[derive(Debug, Error)]
+pub(crate) enum GitHubError {
+    #[error("{0}")]
+    Api(String),
+    #[error("{0}")]
+    Auth(String),
+}
+
+/// Errors from local git repository operations.
+#[derive(Debug, Error)]
+pub(crate) enum GitError {
+    #[error("{0}")]
+    Operation(String),
+}
+
+/// Errors from prompt/agent command execution.
+#[derive(Debug, Error)]
+pub(crate) enum PromptError {
+    #[error("{0}")]
+    Execution(String),
+}
+
+/// Errors from external process launching.
+#[derive(Debug, Error)]
+pub(crate) enum LaunchError {
+    #[error("{0}")]
+    Failed(String),
 }

@@ -26,7 +26,7 @@ impl ArborWindow {
         });
     }
 
-    fn save_agent_presets(&self) -> Result<(), String> {
+    fn save_agent_presets(&self) -> Result<(), StoreError> {
         let presets = self
             .agent_presets
             .iter()
@@ -108,7 +108,7 @@ impl ArborWindow {
         self.set_preset_command_for_kind(modal.active_preset, command);
         if let Err(error) = self.save_agent_presets() {
             if let Some(modal_state) = self.manage_presets_modal.as_mut() {
-                modal_state.error = Some(error);
+                modal_state.error = Some(error.to_string());
             }
             cx.notify();
             return;
@@ -134,7 +134,7 @@ impl ArborWindow {
         ) {
             Ok(command) => command,
             Err(error) => {
-                self.notice = Some(error);
+                self.notice = Some(error.to_string());
                 cx.notify();
                 return;
             },

@@ -13,14 +13,18 @@ fn command_for_execution_mode(
     preset: AgentPresetKind,
     configured_command: &str,
     execution_mode: ExecutionMode,
-) -> Result<String, String> {
+) -> Result<String, PromptError> {
     let configured_command = configured_command.trim();
     if configured_command.is_empty() {
-        return Err(format!("{} preset command is empty", preset.label()));
+        return Err(PromptError::Execution(format!(
+            "{} preset command is empty",
+            preset.label()
+        )));
     }
 
-    let mut tokens = shlex::split(configured_command)
-        .ok_or_else(|| format!("failed to parse {} preset command", preset.label()))?;
+    let mut tokens = shlex::split(configured_command).ok_or_else(|| {
+        PromptError::Execution(format!("failed to parse {} preset command", preset.label()))
+    })?;
     strip_execution_mode_flags(preset, &mut tokens);
 
     match preset {
@@ -72,11 +76,11 @@ fn build_prompt_execution_plan(
     prompt: &str,
     execution_mode: ExecutionMode,
     mode: PromptExecutionMode,
-) -> Result<PromptExecutionPlan, String> {
+) -> Result<PromptExecutionPlan, PromptError> {
     let configured_command = command_for_execution_mode(preset, configured_command, execution_mode)?;
     let prompt = prompt.trim();
     if prompt.is_empty() {
-        return Err("prompt cannot be empty".to_owned());
+        return Err(PromptError::Execution("prompt cannot be empty".to_owned()));
     }
 
     let shell_command = match mode {
@@ -94,10 +98,10 @@ fn build_prompt_execution_plan(
                 format!("{configured_command} -p {} -s", shell_quote(prompt))
             },
             AgentPresetKind::Pi => {
-                return Err(format!(
+                return Err(PromptError::Execution(format!(
                     "{} does not support non-interactive prompt execution yet",
                     preset.label()
-                ));
+                )));
             },
         },
         PromptExecutionMode::TerminalSession => {
@@ -115,7 +119,7 @@ fn run_prompt_capture(
     prompt: &str,
     execution_mode: ExecutionMode,
     operation: &str,
-) -> Result<String, String> {
+) -> Result<String, PromptError> {
     let plan = build_prompt_execution_plan(
         preset,
         configured_command,
@@ -126,14 +130,19 @@ fn run_prompt_capture(
     let mut command = shell_expression_command(&plan.shell_command);
     command.current_dir(worktree_path);
 
-    let output = run_command_output(&mut command, operation)?;
+    let output = run_command_output(&mut command, operation)
+        .map_err(PromptError::Execution)?;
     if !output.status.success() {
-        return Err(command_failure_message(operation, &output));
+        return Err(PromptError::Execution(command_failure_message(
+            operation, &output,
+        )));
     }
 
     let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if text.is_empty() {
-        return Err(format!("{operation} returned empty output"));
+        return Err(PromptError::Execution(format!(
+            "{operation} returned empty output"
+        )));
     }
 
     Ok(text)
@@ -144,7 +153,7 @@ fn prompt_terminal_invocation(
     configured_command: &str,
     prompt: &str,
     execution_mode: ExecutionMode,
-) -> Result<String, String> {
+) -> Result<String, PromptError> {
     build_prompt_execution_plan(
         preset,
         configured_command,
@@ -287,7 +296,9 @@ mod prompt_runner_tests {
         .err()
         .unwrap_or_else(|| panic!("pi capture should be unsupported"));
 
-        assert!(error.contains("Pi does not support non-interactive prompt execution yet"));
+        assert!(error
+            .to_string()
+            .contains("Pi does not support non-interactive prompt execution yet"));
     }
 
     #[test]

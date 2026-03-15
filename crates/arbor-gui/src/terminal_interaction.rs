@@ -2,8 +2,8 @@ fn should_queue_terminal_input(session: &TerminalSession) -> bool {
     session.runtime.is_none() && session.is_initializing
 }
 
-fn terminal_input_unavailable_error(session: &TerminalSession) -> String {
-    format!("terminal `{}` is not available", session.title)
+fn terminal_input_unavailable_error(session: &TerminalSession) -> TerminalError {
+    TerminalError::Pty(format!("terminal `{}` is not available", session.title))
 }
 
 impl ArborWindow {
@@ -16,7 +16,7 @@ impl ArborWindow {
         })
     }
 
-    fn write_input_to_terminal(&mut self, session_id: u64, input: &[u8]) -> Result<(), String> {
+    fn write_input_to_terminal(&mut self, session_id: u64, input: &[u8]) -> Result<(), TerminalError> {
         if input.is_empty() {
             return Ok(());
         }
@@ -47,7 +47,7 @@ impl ArborWindow {
         Ok(())
     }
 
-    fn flush_queued_input_for_terminal(&mut self, session_id: u64) -> Result<(), String> {
+    fn flush_queued_input_for_terminal(&mut self, session_id: u64) -> Result<(), TerminalError> {
         let Some(index) = self
             .terminals
             .iter()

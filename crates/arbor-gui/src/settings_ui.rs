@@ -152,7 +152,7 @@ impl ArborWindow {
                         SettingsSaveOutcome::Saved(None)
                     };
 
-                    Ok::<SettingsSaveOutcome, String>(daemon_bind_result)
+                    Ok::<SettingsSaveOutcome, StoreError>(daemon_bind_result)
                 })
                 .await;
 
@@ -187,7 +187,7 @@ impl ArborWindow {
                         tracing::warn!(%error, "failed to update settings");
                         if let Some(modal_state) = this.settings_modal.as_mut() {
                             modal_state.loading = false;
-                            modal_state.error = Some(error);
+                            modal_state.error = Some(error.to_string());
                         }
                     },
                 }

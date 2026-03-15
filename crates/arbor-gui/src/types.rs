@@ -256,14 +256,14 @@ impl SshTerminalShell {
         })
     }
 
-    fn write_input(&self, bytes: &[u8]) -> Result<(), String> {
+    fn write_input(&self, bytes: &[u8]) -> Result<(), TerminalError> {
         let shell = self
             .shell
             .lock()
-            .map_err(|_| "SSH shell lock poisoned".to_owned())?;
+            .map_err(|_| TerminalError::LockPoisoned("SSH shell"))?;
         shell
             .write_input(bytes)
-            .map_err(|e| format!("failed to write to SSH shell: {e}"))
+            .map_err(|e| TerminalError::Pty(format!("failed to write to SSH shell: {e}")))
     }
 
     /// Poll the shell for new output and feed it to the terminal emulator.
@@ -326,14 +326,14 @@ impl SshTerminalShell {
         }
     }
 
-    fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), TerminalError> {
         let shell = self
             .shell
             .lock()
-            .map_err(|_| "SSH shell lock poisoned".to_owned())?;
+            .map_err(|_| TerminalError::LockPoisoned("SSH shell"))?;
         shell
             .resize(u32::from(cols), u32::from(rows))
-            .map_err(|e| format!("failed to resize SSH shell: {e}"))?;
+            .map_err(|e| TerminalError::Pty(format!("failed to resize SSH shell: {e}")))?;
         drop(shell);
 
         if let Ok(mut emulator) = self.emulator.lock() {
@@ -377,7 +377,7 @@ struct TerminalRuntimeSyncOutcome {
 
 trait EmulatorRuntimeBackend: Clone {
     fn poll(&self);
-    fn write_input(&self, input: &[u8]) -> Result<(), String>;
+    fn write_input(&self, input: &[u8]) -> Result<(), TerminalError>;
     fn snapshot(&self) -> arbor_terminal_emulator::TerminalSnapshot;
     fn resize(
         &self,
@@ -385,7 +385,7 @@ trait EmulatorRuntimeBackend: Clone {
         cols: u16,
         pixel_width: u16,
         pixel_height: u16,
-    ) -> Result<(), String>;
+    ) -> Result<(), TerminalError>;
     fn generation(&self) -> u64;
     fn close(&self);
 }
@@ -406,14 +406,14 @@ trait TerminalRuntimeHandle {
             now,
         )
     }
-    fn write_input(&self, session: &TerminalSession, input: &[u8]) -> Result<(), String>;
+    fn write_input(&self, session: &TerminalSession, input: &[u8]) -> Result<(), TerminalError>;
     fn sync(
         &self,
         session: &mut TerminalSession,
         is_active: bool,
         target_grid_size: Option<(u16, u16, u16, u16)>,
     ) -> TerminalRuntimeSyncOutcome;
-    fn close(&self, session: &TerminalSession) -> Result<(), String>;
+    fn close(&self, session: &TerminalSession) -> Result<(), TerminalError>;
 }
 
 #[derive(Clone, Copy)]
@@ -670,7 +670,7 @@ impl DaemonTerminalWsState {
 impl EmulatorRuntimeBackend for EmbeddedTerminal {
     fn poll(&self) {}
 
-    fn write_input(&self, input: &[u8]) -> Result<(), String> {
+    fn write_input(&self, input: &[u8]) -> Result<(), TerminalError> {
         EmbeddedTerminal::write_input(self, input)
     }
 
@@ -684,7 +684,7 @@ impl EmulatorRuntimeBackend for EmbeddedTerminal {
         cols: u16,
         pixel_width: u16,
         pixel_height: u16,
-    ) -> Result<(), String> {
+    ) -> Result<(), TerminalError> {
         EmbeddedTerminal::resize(self, rows, cols, pixel_width, pixel_height)
     }
 
@@ -702,7 +702,7 @@ impl EmulatorRuntimeBackend for SshTerminalShell {
         let _ = SshTerminalShell::poll(self);
     }
 
-    fn write_input(&self, input: &[u8]) -> Result<(), String> {
+    fn write_input(&self, input: &[u8]) -> Result<(), TerminalError> {
         SshTerminalShell::write_input(self, input)
     }
 
@@ -716,7 +716,7 @@ impl EmulatorRuntimeBackend for SshTerminalShell {
         cols: u16,
         _pixel_width: u16,
         _pixel_height: u16,
-    ) -> Result<(), String> {
+    ) -> Result<(), TerminalError> {
         SshTerminalShell::resize(self, rows, cols)
     }
 
@@ -732,8 +732,9 @@ impl EmulatorRuntimeBackend for SshTerminalShell {
 impl EmulatorRuntimeBackend for arbor_mosh::MoshShell {
     fn poll(&self) {}
 
-    fn write_input(&self, input: &[u8]) -> Result<(), String> {
-        arbor_mosh::MoshShell::write_input(self, input).map_err(|e| e.to_string())
+    fn write_input(&self, input: &[u8]) -> Result<(), TerminalError> {
+        arbor_mosh::MoshShell::write_input(self, input)
+            .map_err(|e| TerminalError::Pty(e.to_string()))
     }
 
     fn snapshot(&self) -> arbor_terminal_emulator::TerminalSnapshot {
@@ -746,8 +747,9 @@ impl EmulatorRuntimeBackend for arbor_mosh::MoshShell {
         cols: u16,
         pixel_width: u16,
         pixel_height: u16,
-    ) -> Result<(), String> {
+    ) -> Result<(), TerminalError> {
         arbor_mosh::MoshShell::resize(self, rows, cols, pixel_width, pixel_height)
+            .map_err(|e| TerminalError::Pty(e.to_string()))
     }
 
     fn generation(&self) -> u64 {
@@ -771,7 +773,7 @@ where
         Duration::ZERO
     }
 
-    fn write_input(&self, _session: &TerminalSession, input: &[u8]) -> Result<(), String> {
+    fn write_input(&self, _session: &TerminalSession, input: &[u8]) -> Result<(), TerminalError> {
         self.backend.write_input(input)
     }
 
@@ -833,7 +835,7 @@ where
         outcome
     }
 
-    fn close(&self, _session: &TerminalSession) -> Result<(), String> {
+    fn close(&self, _session: &TerminalSession) -> Result<(), TerminalError> {
         self.backend.close();
         Ok(())
     }
@@ -882,7 +884,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
         )
     }
 
-    fn write_input(&self, session: &TerminalSession, input: &[u8]) -> Result<(), String> {
+    fn write_input(&self, session: &TerminalSession, input: &[u8]) -> Result<(), TerminalError> {
         if input == [0x03] {
             // Ctrl-C: send as signal for reliable delivery
             self.daemon
@@ -890,7 +892,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
                     session_id: session.daemon_session_id.clone().into(),
                     signal: TerminalSignal::Interrupt,
                 })
-                .map_err(|error| error.to_string())
+                .map_err(|error| TerminalError::Pty(error.to_string()))
         } else if self.ws_state.try_write(input.to_vec()) {
             // Fast path: send via WebSocket binary frame
             tracing::trace!("write_input: sent via WS binary frame");
@@ -903,7 +905,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
                     session_id: session.daemon_session_id.clone().into(),
                     bytes: input.to_vec(),
                 })
-                .map_err(|error| error.to_string())
+                .map_err(|error| TerminalError::Pty(error.to_string()))
         }
     }
 
@@ -1000,7 +1002,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
         outcome
     }
 
-    fn close(&self, session: &TerminalSession) -> Result<(), String> {
+    fn close(&self, session: &TerminalSession) -> Result<(), TerminalError> {
         self.ws_state.close();
 
         let result = if session.state == TerminalState::Running {
@@ -1013,7 +1015,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
             })
         };
 
-        result.map_err(|error| error.to_string())
+        result.map_err(|error| TerminalError::Pty(error.to_string()))
     }
 }
 
@@ -1703,7 +1705,7 @@ struct SshDaemonTunnel {
 }
 
 impl SshDaemonTunnel {
-    fn start(target: &SshDaemonTarget) -> Result<Self, String> {
+    fn start(target: &SshDaemonTarget) -> Result<Self, ConnectionError> {
         let local_port = reserve_local_loopback_port()?;
         let forward = format!("127.0.0.1:{local_port}:127.0.0.1:{}", target.daemon_port);
 
@@ -1731,10 +1733,10 @@ impl SshDaemonTunnel {
             .stderr(Stdio::null());
 
         let child = command.spawn().map_err(|error| {
-            format!(
+            ConnectionError::Io(format!(
                 "failed to launch ssh tunnel to {}: {error}",
                 target.ssh_destination()
-            )
+            ))
         })?;
 
         Ok(Self { child, local_port })

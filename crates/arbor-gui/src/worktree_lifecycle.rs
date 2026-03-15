@@ -2595,7 +2595,8 @@ fn create_review_worktree(
         &repo_slug,
         &pr_reference_input,
         github_token.as_deref(),
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
 
     let requested_name = if worktree_name_input.trim().is_empty() {
         default_review_worktree_name(&pull_request)

@@ -1,4 +1,5 @@
 use {
+    crate::StoreError,
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
@@ -34,27 +35,22 @@ pub fn load_history() -> Vec<ConnectionHistoryEntry> {
     entries
 }
 
-pub fn save_history(entries: &[ConnectionHistoryEntry]) -> Result<(), String> {
+pub fn save_history(entries: &[ConnectionHistoryEntry]) -> Result<(), StoreError> {
     let path = history_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create connection history directory `{}`: {error}",
-                parent.display()
-            )
+        fs::create_dir_all(parent).map_err(|source| StoreError::CreateDir {
+            path: parent.display().to_string(),
+            source,
         })?;
     }
-    let json = serde_json::to_string_pretty(entries).map_err(|error| {
-        format!(
-            "failed to serialize connection history `{}`: {error}",
-            path.display()
-        )
-    })?;
-    fs::write(&path, json).map_err(|error| {
-        format!(
-            "failed to write connection history `{}`: {error}",
-            path.display()
-        )
+    let json =
+        serde_json::to_string_pretty(entries).map_err(|source| StoreError::JsonSerialize {
+            path: path.display().to_string(),
+            source,
+        })?;
+    fs::write(&path, json).map_err(|source| StoreError::Write {
+        path: path.display().to_string(),
+        source,
     })
 }
 
@@ -111,27 +107,22 @@ pub fn load_tokens() -> HashMap<String, String> {
     serde_json::from_str(&data).unwrap_or_default()
 }
 
-pub fn save_tokens(tokens: &HashMap<String, String>) -> Result<(), String> {
+pub fn save_tokens(tokens: &HashMap<String, String>) -> Result<(), StoreError> {
     let path = tokens_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create daemon auth token directory `{}`: {error}",
-                parent.display()
-            )
+        fs::create_dir_all(parent).map_err(|source| StoreError::CreateDir {
+            path: parent.display().to_string(),
+            source,
         })?;
     }
-    let json = serde_json::to_string_pretty(tokens).map_err(|error| {
-        format!(
-            "failed to serialize daemon auth tokens `{}`: {error}",
-            path.display()
-        )
-    })?;
-    fs::write(&path, json).map_err(|error| {
-        format!(
-            "failed to write daemon auth tokens `{}`: {error}",
-            path.display()
-        )
+    let json =
+        serde_json::to_string_pretty(tokens).map_err(|source| StoreError::JsonSerialize {
+            path: path.display().to_string(),
+            source,
+        })?;
+    fs::write(&path, json).map_err(|source| StoreError::Write {
+        path: path.display().to_string(),
+        source,
     })
 }
 

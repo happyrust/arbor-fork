@@ -1,4 +1,5 @@
 use {
+    crate::StoreError,
     arbor_core::repo_config,
     config::{Config, File},
     serde::Deserialize,
@@ -117,18 +118,18 @@ pub trait AppConfigStore: Send + Sync {
     fn config_path(&self) -> PathBuf;
     fn config_last_modified(&self) -> Option<SystemTime>;
     fn load_or_create_config(&self) -> LoadedArborConfig;
-    fn append_remote_host(&self, host: &RemoteHostConfig) -> Result<(), String>;
-    fn remove_remote_host(&self, name: &str) -> Result<(), String>;
+    fn append_remote_host(&self, host: &RemoteHostConfig) -> Result<(), StoreError>;
+    fn remove_remote_host(&self, name: &str) -> Result<(), StoreError>;
     fn load_repo_config(&self, repo_root: &Path) -> Option<RepoConfig>;
     fn save_repo_presets(
         &self,
         repo_root: &Path,
         presets: &[RepoPresetConfig],
-    ) -> Result<(), String>;
-    fn remove_repo_preset(&self, repo_root: &Path, name: &str) -> Result<(), String>;
-    fn save_scalar_settings(&self, settings: &[(&str, Option<&str>)]) -> Result<(), String>;
-    fn save_daemon_bind_mode(&self, bind_mode: Option<&str>) -> Result<(), String>;
-    fn save_agent_presets(&self, presets: &[AgentPresetConfig]) -> Result<(), String>;
+    ) -> Result<(), StoreError>;
+    fn remove_repo_preset(&self, repo_root: &Path, name: &str) -> Result<(), StoreError>;
+    fn save_scalar_settings(&self, settings: &[(&str, Option<&str>)]) -> Result<(), StoreError>;
+    fn save_daemon_bind_mode(&self, bind_mode: Option<&str>) -> Result<(), StoreError>;
+    fn save_agent_presets(&self, presets: &[AgentPresetConfig]) -> Result<(), StoreError>;
 }
 
 pub struct FileAppConfigStore {
@@ -160,11 +161,11 @@ impl AppConfigStore for FileAppConfigStore {
         load_or_create_config_at(&self.path)
     }
 
-    fn append_remote_host(&self, host: &RemoteHostConfig) -> Result<(), String> {
+    fn append_remote_host(&self, host: &RemoteHostConfig) -> Result<(), StoreError> {
         append_remote_host_at(&self.path, host)
     }
 
-    fn remove_remote_host(&self, name: &str) -> Result<(), String> {
+    fn remove_remote_host(&self, name: &str) -> Result<(), StoreError> {
         remove_remote_host_at(&self.path, name)
     }
 
@@ -176,23 +177,23 @@ impl AppConfigStore for FileAppConfigStore {
         &self,
         repo_root: &Path,
         presets: &[RepoPresetConfig],
-    ) -> Result<(), String> {
+    ) -> Result<(), StoreError> {
         save_repo_presets(repo_root, presets)
     }
 
-    fn remove_repo_preset(&self, repo_root: &Path, name: &str) -> Result<(), String> {
+    fn remove_repo_preset(&self, repo_root: &Path, name: &str) -> Result<(), StoreError> {
         remove_repo_preset(repo_root, name)
     }
 
-    fn save_scalar_settings(&self, settings: &[(&str, Option<&str>)]) -> Result<(), String> {
+    fn save_scalar_settings(&self, settings: &[(&str, Option<&str>)]) -> Result<(), StoreError> {
         save_scalar_settings_at(&self.path, settings)
     }
 
-    fn save_daemon_bind_mode(&self, bind_mode: Option<&str>) -> Result<(), String> {
+    fn save_daemon_bind_mode(&self, bind_mode: Option<&str>) -> Result<(), StoreError> {
         save_daemon_bind_mode_at(&self.path, bind_mode)
     }
 
-    fn save_agent_presets(&self, presets: &[AgentPresetConfig]) -> Result<(), String> {
+    fn save_agent_presets(&self, presets: &[AgentPresetConfig]) -> Result<(), StoreError> {
         save_agent_presets_at(&self.path, presets)
     }
 }
@@ -256,18 +257,22 @@ fn default_config_path() -> PathBuf {
     }
 }
 
-fn append_remote_host_at(path: &Path, host: &RemoteHostConfig) -> Result<(), String> {
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let mut doc: DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+fn append_remote_host_at(path: &Path, host: &RemoteHostConfig) -> Result<(), StoreError> {
+    let path_str = path.display().to_string();
+    let content = fs::read_to_string(path).map_err(|source| StoreError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let mut doc: DocumentMut = content.parse().map_err(|source| StoreError::TomlParse {
+        path: path_str.clone(),
+        source,
+    })?;
 
     let arr = doc
         .entry("remote_hosts")
         .or_insert_with(|| toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
         .as_array_of_tables_mut()
-        .ok_or_else(|| "remote_hosts is not an array of tables".to_owned())?;
+        .ok_or_else(|| StoreError::Other("remote_hosts is not an array of tables".to_owned()))?;
 
     let mut table = toml_edit::Table::new();
     table.insert("name", toml_edit::value(&host.name));
@@ -288,15 +293,22 @@ fn append_remote_host_at(path: &Path, host: &RemoteHostConfig) -> Result<(), Str
 
     arr.push(table);
 
-    fs::write(path, doc.to_string()).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(path, doc.to_string()).map_err(|source| StoreError::Write {
+        path: path_str,
+        source,
+    })
 }
 
-fn remove_remote_host_at(path: &Path, name: &str) -> Result<(), String> {
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let mut doc: DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+fn remove_remote_host_at(path: &Path, name: &str) -> Result<(), StoreError> {
+    let path_str = path.display().to_string();
+    let content = fs::read_to_string(path).map_err(|source| StoreError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let mut doc: DocumentMut = content.parse().map_err(|source| StoreError::TomlParse {
+        path: path_str.clone(),
+        source,
+    })?;
 
     if let Some(arr) = doc
         .get_mut("remote_hosts")
@@ -317,7 +329,10 @@ fn remove_remote_host_at(path: &Path, name: &str) -> Result<(), String> {
         }
     }
 
-    fs::write(path, doc.to_string()).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(path, doc.to_string()).map_err(|source| StoreError::Write {
+        path: path_str,
+        source,
+    })
 }
 
 // ── Per-repository config (arbor.toml) ───────────────────────────────
@@ -329,16 +344,21 @@ pub fn load_repo_config(repo_root: &Path) -> Option<RepoConfig> {
     repo_config::load_repo_config(repo_root)
 }
 
-pub fn save_repo_presets(repo_root: &Path, presets: &[RepoPresetConfig]) -> Result<(), String> {
+pub fn save_repo_presets(repo_root: &Path, presets: &[RepoPresetConfig]) -> Result<(), StoreError> {
     let path = repo_root.join("arbor.toml");
+    let path_str = path.display().to_string();
     let content = if path.exists() {
-        fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?
+        fs::read_to_string(&path).map_err(|source| StoreError::Read {
+            path: path_str.clone(),
+            source,
+        })?
     } else {
         String::new()
     };
-    let mut doc: DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    let mut doc: DocumentMut = content.parse().map_err(|source| StoreError::TomlParse {
+        path: path_str.clone(),
+        source,
+    })?;
 
     doc.remove("presets");
 
@@ -354,17 +374,23 @@ pub fn save_repo_presets(repo_root: &Path, presets: &[RepoPresetConfig]) -> Resu
         doc.insert("presets", toml_edit::Item::ArrayOfTables(arr));
     }
 
-    fs::write(&path, doc.to_string())
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(&path, doc.to_string()).map_err(|source| StoreError::Write {
+        path: path_str,
+        source,
+    })
 }
 
-pub fn remove_repo_preset(repo_root: &Path, name: &str) -> Result<(), String> {
+pub fn remove_repo_preset(repo_root: &Path, name: &str) -> Result<(), StoreError> {
     let path = repo_root.join("arbor.toml");
-    let content =
-        fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let mut doc: DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    let path_str = path.display().to_string();
+    let content = fs::read_to_string(&path).map_err(|source| StoreError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let mut doc: DocumentMut = content.parse().map_err(|source| StoreError::TomlParse {
+        path: path_str.clone(),
+        source,
+    })?;
 
     if let Some(arr) = doc
         .get_mut("presets")
@@ -385,16 +411,25 @@ pub fn remove_repo_preset(repo_root: &Path, name: &str) -> Result<(), String> {
         }
     }
 
-    fs::write(&path, doc.to_string())
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(&path, doc.to_string()).map_err(|source| StoreError::Write {
+        path: path_str,
+        source,
+    })
 }
 
-fn save_scalar_settings_at(path: &Path, settings: &[(&str, Option<&str>)]) -> Result<(), String> {
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let mut doc: DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+fn save_scalar_settings_at(
+    path: &Path,
+    settings: &[(&str, Option<&str>)],
+) -> Result<(), StoreError> {
+    let path_str = path.display().to_string();
+    let content = fs::read_to_string(path).map_err(|source| StoreError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let mut doc: DocumentMut = content.parse().map_err(|source| StoreError::TomlParse {
+        path: path_str.clone(),
+        source,
+    })?;
 
     for &(key, value) in settings {
         match value {
@@ -407,15 +442,22 @@ fn save_scalar_settings_at(path: &Path, settings: &[(&str, Option<&str>)]) -> Re
         }
     }
 
-    fs::write(path, doc.to_string()).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(path, doc.to_string()).map_err(|source| StoreError::Write {
+        path: path_str,
+        source,
+    })
 }
 
-fn save_daemon_bind_mode_at(path: &Path, bind_mode: Option<&str>) -> Result<(), String> {
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let mut doc: DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+fn save_daemon_bind_mode_at(path: &Path, bind_mode: Option<&str>) -> Result<(), StoreError> {
+    let path_str = path.display().to_string();
+    let content = fs::read_to_string(path).map_err(|source| StoreError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let mut doc: DocumentMut = content.parse().map_err(|source| StoreError::TomlParse {
+        path: path_str.clone(),
+        source,
+    })?;
 
     match bind_mode.filter(|value| !value.trim().is_empty()) {
         Some(value) => {
@@ -423,7 +465,7 @@ fn save_daemon_bind_mode_at(path: &Path, bind_mode: Option<&str>) -> Result<(), 
                 .entry("daemon")
                 .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
                 .as_table_mut()
-                .ok_or_else(|| "daemon is not a table".to_owned())?;
+                .ok_or_else(|| StoreError::Other("daemon is not a table".to_owned()))?;
             daemon_table.insert("bind", toml_edit::value(value));
         },
         None => {
@@ -436,15 +478,22 @@ fn save_daemon_bind_mode_at(path: &Path, bind_mode: Option<&str>) -> Result<(), 
         },
     }
 
-    fs::write(path, doc.to_string()).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(path, doc.to_string()).map_err(|source| StoreError::Write {
+        path: path_str,
+        source,
+    })
 }
 
-fn save_agent_presets_at(path: &Path, presets: &[AgentPresetConfig]) -> Result<(), String> {
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let mut doc: DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+fn save_agent_presets_at(path: &Path, presets: &[AgentPresetConfig]) -> Result<(), StoreError> {
+    let path_str = path.display().to_string();
+    let content = fs::read_to_string(path).map_err(|source| StoreError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let mut doc: DocumentMut = content.parse().map_err(|source| StoreError::TomlParse {
+        path: path_str.clone(),
+        source,
+    })?;
 
     doc.remove("agent_presets");
 
@@ -459,5 +508,8 @@ fn save_agent_presets_at(path: &Path, presets: &[AgentPresetConfig]) -> Result<(
         doc.insert("agent_presets", toml_edit::Item::ArrayOfTables(arr));
     }
 
-    fs::write(path, doc.to_string()).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(path, doc.to_string()).map_err(|source| StoreError::Write {
+        path: path_str,
+        source,
+    })
 }

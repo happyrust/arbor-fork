@@ -1,4 +1,5 @@
 use {
+    crate::LaunchError,
     std::{sync::mpsc, thread},
     zeroconf::{BrowserEvent, MdnsBrowser, ServiceType, prelude::*},
 };
@@ -55,9 +56,9 @@ struct ZeroconfBrowser {
 }
 
 /// Start browsing for `_arbor._tcp` services on the local network.
-pub fn start_browsing() -> Result<Box<dyn MdnsDiscovery>, String> {
+pub fn start_browsing() -> Result<Box<dyn MdnsDiscovery>, LaunchError> {
     let service_type = ServiceType::new(SERVICE_NAME, SERVICE_PROTOCOL)
-        .map_err(|e| format!("failed to create service type: {e}"))?;
+        .map_err(|e| LaunchError::Failed(format!("failed to create service type: {e}")))?;
 
     let (tx, rx) = mpsc::channel();
 
@@ -130,7 +131,7 @@ pub fn start_browsing() -> Result<Box<dyn MdnsDiscovery>, String> {
                 }
             }
         })
-        .map_err(|e| format!("failed to spawn mDNS browse thread: {e}"))?;
+        .map_err(|e| LaunchError::Failed(format!("failed to spawn mDNS browse thread: {e}")))?;
 
     Ok(Box::new(ZeroconfBrowser {
         receiver: rx,

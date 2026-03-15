@@ -4183,7 +4183,7 @@ impl ArborWindow {
                             clear_global_daemon,
                         },
                         Err(error) => SpawnTerminalOutcome::Failed {
-                            error,
+                            error: error.to_string(),
                             notice: fallback_notice,
                             clear_global_daemon,
                         },
@@ -5704,7 +5704,7 @@ fn run_agent_auto_checkpoint_inner(
             diff_summary: changes::diff_line_summary(&request.path).ok(),
             branch_divergence: branch_divergence_summary(&request.path),
         }),
-        Err(error) if error == "nothing to commit" => None,
+        Err(GitError::Operation(ref msg)) if msg == "nothing to commit" => None,
         Err(error) => Some(AgentAutoCheckpointResult {
             notice: Some(format!("auto-checkpoint failed: {error}")),
             committed: false,
@@ -5819,19 +5819,26 @@ fn should_emit_agent_finished_notification(
     true
 }
 
-fn install_claude_code_hooks(daemon_base_url: &str) -> Result<(), String> {
-    let home = env::var("HOME").map_err(|_| "HOME not set".to_owned())?;
+fn install_claude_code_hooks(daemon_base_url: &str) -> Result<(), StoreError> {
+    let home = env::var("HOME").map_err(|_| StoreError::Other("HOME not set".to_owned()))?;
     let claude_dir = PathBuf::from(&home).join(".claude");
     let settings_path = claude_dir.join("settings.json");
 
     let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)
-            .map_err(|e| format!("failed to read settings.json: {e}"))?;
-        serde_json::from_str(&content).map_err(|e| format!("failed to parse settings.json: {e}"))?
+        let content = fs::read_to_string(&settings_path).map_err(|source| StoreError::Read {
+            path: settings_path.display().to_string(),
+            source,
+        })?;
+        serde_json::from_str(&content).map_err(|source| StoreError::JsonParse {
+            path: settings_path.display().to_string(),
+            source,
+        })?
     } else {
         if !claude_dir.exists() {
-            fs::create_dir_all(&claude_dir)
-                .map_err(|e| format!("failed to create .claude dir: {e}"))?;
+            fs::create_dir_all(&claude_dir).map_err(|source| StoreError::CreateDir {
+                path: claude_dir.display().to_string(),
+                source,
+            })?;
         }
         serde_json::json!({})
     };
@@ -5862,11 +5869,13 @@ fn install_claude_code_hooks(daemon_base_url: &str) -> Result<(), String> {
 
     let hooks = settings
         .as_object_mut()
-        .ok_or("settings.json is not an object")?
+        .ok_or_else(|| StoreError::Other("settings.json is not an object".to_owned()))?
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
 
-    let hooks_obj = hooks.as_object_mut().ok_or("hooks is not an object")?;
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or_else(|| StoreError::Other("hooks is not an object".to_owned()))?;
 
     if !hooks_obj.contains_key("UserPromptSubmit") {
         hooks_obj.insert("UserPromptSubmit".to_owned(), hook_entry.clone());
@@ -5875,10 +5884,15 @@ fn install_claude_code_hooks(daemon_base_url: &str) -> Result<(), String> {
         hooks_obj.insert("Stop".to_owned(), hook_entry);
     }
 
-    let serialized = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("failed to serialize settings: {e}"))?;
-    fs::write(&settings_path, serialized)
-        .map_err(|e| format!("failed to write settings.json: {e}"))?;
+    let serialized =
+        serde_json::to_string_pretty(&settings).map_err(|source| StoreError::JsonSerialize {
+            path: settings_path.display().to_string(),
+            source,
+        })?;
+    fs::write(&settings_path, serialized).map_err(|source| StoreError::Write {
+        path: settings_path.display().to_string(),
+        source,
+    })?;
 
     tracing::info!(path = %settings_path.display(), "installed Claude Code hooks");
     Ok(())
@@ -5887,26 +5901,30 @@ fn install_claude_code_hooks(daemon_base_url: &str) -> Result<(), String> {
 const PI_AGENT_EXTENSION_FILENAME: &str = "arbor-activity.ts";
 const PI_AGENT_EXTENSION_MARKER: &str = "Managed by Arbor: Pi activity bridge";
 
-fn install_pi_agent_extension(daemon_base_url: &str) -> Result<(), String> {
-    let home = env::var("HOME").map_err(|_| "HOME not set".to_owned())?;
+fn install_pi_agent_extension(daemon_base_url: &str) -> Result<(), StoreError> {
+    let home = env::var("HOME").map_err(|_| StoreError::Other("HOME not set".to_owned()))?;
     let extensions_dir = PathBuf::from(&home)
         .join(".pi")
         .join("agent")
         .join("extensions");
-    fs::create_dir_all(&extensions_dir)
-        .map_err(|e| format!("failed to create Pi extensions dir: {e}"))?;
+    fs::create_dir_all(&extensions_dir).map_err(|source| StoreError::CreateDir {
+        path: extensions_dir.display().to_string(),
+        source,
+    })?;
 
     let extension_path = extensions_dir.join(PI_AGENT_EXTENSION_FILENAME);
     let next_content = render_pi_agent_extension(daemon_base_url);
 
     if extension_path.exists() {
-        let existing = fs::read_to_string(&extension_path)
-            .map_err(|e| format!("failed to read Pi extension: {e}"))?;
+        let existing = fs::read_to_string(&extension_path).map_err(|source| StoreError::Read {
+            path: extension_path.display().to_string(),
+            source,
+        })?;
         if !existing.contains(PI_AGENT_EXTENSION_MARKER) {
-            return Err(format!(
+            return Err(StoreError::Other(format!(
                 "refusing to overwrite existing Pi extension `{}`",
                 extension_path.display()
-            ));
+            )));
         }
         if existing == next_content {
             tracing::debug!("Pi activity extension already installed");
@@ -5914,8 +5932,10 @@ fn install_pi_agent_extension(daemon_base_url: &str) -> Result<(), String> {
         }
     }
 
-    fs::write(&extension_path, next_content)
-        .map_err(|e| format!("failed to write Pi extension: {e}"))?;
+    fs::write(&extension_path, next_content).map_err(|source| StoreError::Write {
+        path: extension_path.display().to_string(),
+        source,
+    })?;
     tracing::info!(path = %extension_path.display(), "installed Pi activity extension");
     Ok(())
 }
@@ -6431,7 +6451,7 @@ fn diff_tab_title(session: &DiffSession) -> String {
 fn build_worktree_diff_document(
     worktree_path: &Path,
     changed_files: &[ChangedFile],
-) -> Result<(Vec<DiffLine>, HashMap<PathBuf, usize>), String> {
+) -> Result<(Vec<DiffLine>, HashMap<PathBuf, usize>), GitError> {
     let mut lines = Vec::new();
     let mut file_row_indices = HashMap::new();
 
@@ -6474,7 +6494,7 @@ fn build_file_diff_lines(
     worktree_path: &Path,
     file_path: &Path,
     change_kind: ChangeKind,
-) -> Result<Vec<DiffLine>, String> {
+) -> Result<Vec<DiffLine>, GitError> {
     let head_bytes = match change_kind {
         ChangeKind::Added | ChangeKind::IntentToAdd => Vec::new(),
         _ => read_head_file_bytes(worktree_path, file_path)?,
@@ -6488,15 +6508,15 @@ fn build_file_diff_lines(
     Ok(build_side_by_side_diff_lines(&head_text, &worktree_text))
 }
 
-fn read_head_file_bytes(worktree_path: &Path, file_path: &Path) -> Result<Vec<u8>, String> {
+fn read_head_file_bytes(worktree_path: &Path, file_path: &Path) -> Result<Vec<u8>, GitError> {
     let relative = git_relative_path(file_path)?;
     let object_spec = format!("HEAD:{relative}");
 
     let repo = gix::open(worktree_path).map_err(|error| {
-        format!(
+        GitError::Operation(format!(
             "failed to open repository at `{}`: {error}",
             worktree_path.display()
-        )
+        ))
     })?;
 
     let object_id = match repo.rev_parse_single(object_spec.as_str()) {
@@ -6505,31 +6525,31 @@ fn read_head_file_bytes(worktree_path: &Path, file_path: &Path) -> Result<Vec<u8
     };
 
     let object = object_id.object().map_err(|error| {
-        format!(
+        GitError::Operation(format!(
             "failed to read `{relative}` at HEAD in `{}`: {error}",
             worktree_path.display()
-        )
+        ))
     })?;
 
     Ok(object.data.to_vec())
 }
 
-fn read_worktree_file_bytes(worktree_path: &Path, file_path: &Path) -> Result<Vec<u8>, String> {
+fn read_worktree_file_bytes(worktree_path: &Path, file_path: &Path) -> Result<Vec<u8>, GitError> {
     let absolute = worktree_path.join(file_path);
     match fs::read(&absolute) {
         Ok(bytes) => Ok(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(format!(
+        Err(error) => Err(GitError::Operation(format!(
             "failed to read worktree file `{}`: {error}",
             absolute.display()
-        )),
+        ))),
     }
 }
 
-fn git_relative_path(file_path: &Path) -> Result<String, String> {
+fn git_relative_path(file_path: &Path) -> Result<String, GitError> {
     let path_text = file_path.to_string_lossy();
     if path_text.trim().is_empty() {
-        return Err("cannot diff an empty path".to_owned());
+        return Err(GitError::Operation("cannot diff an empty path".to_owned()));
     }
 
     Ok(path_text.replace('\\', "/"))
@@ -8052,16 +8072,22 @@ fn detect_ports_for_worktrees(
 
 fn load_static_ports_for_worktree(
     worktree_path: &Path,
-) -> Result<Option<Vec<DetectedPort>>, String> {
+) -> Result<Option<Vec<DetectedPort>>, StoreError> {
     let path = worktree_path.join(".arbor").join("ports.json");
     if !path.exists() {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&path)
-        .map_err(|error| format!("failed to read `{}`: {error}", path.display()))?;
-    let config = serde_json::from_str::<StaticPortsConfig>(&content)
-        .map_err(|error| format!("failed to parse `{}`: {error}", path.display()))?;
+    let content = fs::read_to_string(&path).map_err(|source| StoreError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let config = serde_json::from_str::<StaticPortsConfig>(&content).map_err(|source| {
+        StoreError::JsonParse {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
 
     Ok(Some(
         config

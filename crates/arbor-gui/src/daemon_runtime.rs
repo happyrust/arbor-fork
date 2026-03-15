@@ -202,18 +202,22 @@ fn runtime_sync_interval_elapsed(
 
 fn daemon_websocket_request(
     connect_config: &terminal_daemon_http::WebsocketConnectConfig,
-) -> Result<tungstenite::http::Request<()>, String> {
+) -> Result<tungstenite::http::Request<()>, ConnectionError> {
     use tungstenite::client::IntoClientRequest;
 
     let mut request = connect_config
         .url
         .as_str()
         .into_client_request()
-        .map_err(|error| format!("failed to create websocket request: {error}"))?;
+        .map_err(|error| {
+            ConnectionError::Parse(format!("failed to create websocket request: {error}"))
+        })?;
 
     if let Some(token) = connect_config.auth_token.as_ref() {
         let header_value = tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|error| format!("failed to encode websocket auth token: {error}"))?;
+            .map_err(|error| {
+                ConnectionError::Parse(format!("failed to encode websocket auth token: {error}"))
+            })?;
         request
             .headers_mut()
             .insert(tungstenite::http::header::AUTHORIZATION, header_value);
@@ -689,10 +693,10 @@ fn daemon_base_url_from_config(raw: Option<&str>) -> String {
         .to_owned()
 }
 
-fn parse_connect_host_target(raw: &str) -> Result<ConnectHostTarget, String> {
+fn parse_connect_host_target(raw: &str) -> Result<ConnectHostTarget, ConnectionError> {
     let value = raw.trim();
     if value.is_empty() {
-        return Err("Address cannot be empty".to_owned());
+        return Err(ConnectionError::Parse("Address cannot be empty".to_owned()));
     }
 
     if value.starts_with("ssh://") {
@@ -702,10 +706,10 @@ fn parse_connect_host_target(raw: &str) -> Result<ConnectHostTarget, String> {
     }
 
     if value.starts_with("https://") {
-        return Err(
+        return Err(ConnectionError::Parse(
             "https:// is not supported by arbor-httpd; use http://HOST:PORT or ssh://HOST/"
                 .to_owned(),
-        );
+        ));
     }
 
     if value.starts_with("http://") {
@@ -716,9 +720,9 @@ fn parse_connect_host_target(raw: &str) -> Result<ConnectHostTarget, String> {
     }
 
     if value.contains("://") {
-        return Err(
+        return Err(ConnectionError::Parse(
             "unsupported scheme; use http://HOST:PORT or ssh://[user@]HOST[:ssh_port]/".to_owned(),
-        );
+        ));
     }
 
     let normalized = if value.contains(':') {
@@ -733,12 +737,16 @@ fn parse_connect_host_target(raw: &str) -> Result<ConnectHostTarget, String> {
     })
 }
 
-fn parse_ssh_daemon_target(raw: &str) -> Result<SshDaemonTarget, String> {
+fn parse_ssh_daemon_target(raw: &str) -> Result<SshDaemonTarget, ConnectionError> {
     let Some(without_scheme) = raw.trim().strip_prefix("ssh://") else {
-        return Err("ssh address must start with ssh://".to_owned());
+        return Err(ConnectionError::Parse(
+            "ssh address must start with ssh://".to_owned(),
+        ));
     };
     if without_scheme.is_empty() {
-        return Err("ssh address is missing a host".to_owned());
+        return Err(ConnectionError::Parse(
+            "ssh address is missing a host".to_owned(),
+        ));
     }
 
     let (authority, path_tail) = match without_scheme.split_once('/') {
@@ -747,7 +755,9 @@ fn parse_ssh_daemon_target(raw: &str) -> Result<SshDaemonTarget, String> {
     };
 
     if authority.trim().is_empty() {
-        return Err("ssh address is missing a host".to_owned());
+        return Err(ConnectionError::Parse(
+            "ssh address is missing a host".to_owned(),
+        ));
     }
 
     let (user, host, ssh_port) = parse_ssh_authority(authority)?;
@@ -761,14 +771,18 @@ fn parse_ssh_daemon_target(raw: &str) -> Result<SshDaemonTarget, String> {
     })
 }
 
-fn parse_ssh_authority(authority: &str) -> Result<(Option<String>, String, u16), String> {
+fn parse_ssh_authority(authority: &str) -> Result<(Option<String>, String, u16), ConnectionError> {
     let (user, host_port) = match authority.rsplit_once('@') {
         Some((candidate_user, host_port))
             if !candidate_user.trim().is_empty() && !host_port.trim().is_empty() =>
         {
             (Some(candidate_user.trim().to_owned()), host_port.trim())
         },
-        Some(_) => return Err("invalid ssh address: malformed user@host section".to_owned()),
+        Some(_) => {
+            return Err(ConnectionError::Parse(
+                "invalid ssh address: malformed user@host section".to_owned(),
+            ))
+        },
         None => (None, authority.trim()),
     };
 
@@ -776,40 +790,47 @@ fn parse_ssh_authority(authority: &str) -> Result<(Option<String>, String, u16),
     Ok((user, host, port))
 }
 
-fn parse_ssh_daemon_port(path_tail: &str) -> Result<u16, String> {
+fn parse_ssh_daemon_port(path_tail: &str) -> Result<u16, ConnectionError> {
     let trimmed = path_tail.trim_matches('/');
     if trimmed.is_empty() {
         return Ok(DEFAULT_DAEMON_PORT);
     }
     if trimmed.contains('/') || trimmed.contains('?') || trimmed.contains('#') {
-        return Err(
+        return Err(ConnectionError::Parse(
             "invalid ssh address path: only an optional daemon port is allowed, for example ssh://host/8787"
                 .to_owned(),
-        );
+        ));
     }
 
     trimmed
         .parse::<u16>()
-        .map_err(|error| format!("invalid daemon port `{trimmed}`: {error}"))
+        .map_err(|error| ConnectionError::Parse(format!("invalid daemon port `{trimmed}`: {error}")))
 }
 
-fn parse_host_and_optional_port(value: &str, default_port: u16) -> Result<(String, u16), String> {
+fn parse_host_and_optional_port(
+    value: &str,
+    default_port: u16,
+) -> Result<(String, u16), ConnectionError> {
     if let Some(rest) = value.strip_prefix('[') {
         let Some((host, suffix)) = rest.split_once(']') else {
-            return Err("invalid host: missing closing `]` for IPv6 address".to_owned());
+            return Err(ConnectionError::Parse(
+                "invalid host: missing closing `]` for IPv6 address".to_owned(),
+            ));
         };
         if host.trim().is_empty() {
-            return Err("host is empty".to_owned());
+            return Err(ConnectionError::Parse("host is empty".to_owned()));
         }
         if suffix.is_empty() {
             return Ok((host.to_owned(), default_port));
         }
         let Some(port_text) = suffix.strip_prefix(':') else {
-            return Err("invalid host: unexpected characters after IPv6 address".to_owned());
+            return Err(ConnectionError::Parse(
+                "invalid host: unexpected characters after IPv6 address".to_owned(),
+            ));
         };
         let port = port_text
             .parse::<u16>()
-            .map_err(|error| format!("invalid port `{port_text}`: {error}"))?;
+            .map_err(|error| ConnectionError::Parse(format!("invalid port `{port_text}`: {error}")))?;
         return Ok((host.to_owned(), port));
     }
 
@@ -818,14 +839,16 @@ fn parse_host_and_optional_port(value: &str, default_port: u16) -> Result<(Strin
     };
 
     if host.contains(':') {
-        return Err("IPv6 hosts must be wrapped in brackets, for example [::1]".to_owned());
+        return Err(ConnectionError::Parse(
+            "IPv6 hosts must be wrapped in brackets, for example [::1]".to_owned(),
+        ));
     }
     if host.trim().is_empty() {
-        return Err("host is empty".to_owned());
+        return Err(ConnectionError::Parse("host is empty".to_owned()));
     }
     let port = port_text
         .parse::<u16>()
-        .map_err(|error| format!("invalid port `{port_text}`: {error}"))?;
+        .map_err(|error| ConnectionError::Parse(format!("invalid port `{port_text}`: {error}")))?;
     Ok((host.to_owned(), port))
 }
 
@@ -845,13 +868,15 @@ fn format_ssh_auth_key(target: &SshDaemonTarget) -> String {
     format!("ssh://{authority}/{}", target.daemon_port)
 }
 
-fn reserve_local_loopback_port() -> Result<u16, String> {
+fn reserve_local_loopback_port() -> Result<u16, ConnectionError> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|error| format!("failed to reserve local port: {error}"))?;
+        .map_err(|error| ConnectionError::Io(format!("failed to reserve local port: {error}")))?;
     listener
         .local_addr()
         .map(|addr| addr.port())
-        .map_err(|error| format!("failed to resolve local tunnel port: {error}"))
+        .map_err(|error| {
+            ConnectionError::Io(format!("failed to resolve local tunnel port: {error}"))
+        })
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {

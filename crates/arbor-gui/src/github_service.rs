@@ -1,4 +1,5 @@
 use {
+    crate::GitHubError,
     graphql_client::GraphQLQuery,
     serde::{Deserialize, Serialize},
     std::{
@@ -664,7 +665,7 @@ pub trait GitHubService: Send + Sync {
         branch: &str,
         base_branch: &str,
         token: &str,
-    ) -> Result<String, String>;
+    ) -> Result<String, GitHubError>;
 
     fn open_pull_request_number(&self, repo_slug: &str, branch: &str, token: &str) -> Option<u64>;
 }
@@ -679,10 +680,10 @@ impl GitHubService for OctocrabGitHubService {
         branch: &str,
         base_branch: &str,
         token: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, GitHubError> {
         let (owner, repo_name) = repo_slug
             .split_once('/')
-            .ok_or_else(|| format!("invalid repository slug: {repo_slug}"))?;
+            .ok_or_else(|| GitHubError::Api(format!("invalid repository slug: {repo_slug}")))?;
 
         let owner = owner.to_owned();
         let repo_name = repo_name.to_owned();
@@ -692,20 +693,24 @@ impl GitHubService for OctocrabGitHubService {
         let token = token.to_owned();
 
         let runtime = tokio::runtime::Runtime::new()
-            .map_err(|error| format!("failed to create runtime: {error}"))?;
+            .map_err(|error| GitHubError::Api(format!("failed to create runtime: {error}")))?;
 
         runtime.block_on(async move {
             let octocrab = octocrab::Octocrab::builder()
                 .personal_token(token)
                 .build()
-                .map_err(|error| format!("failed to create GitHub client: {error}"))?;
+                .map_err(|error| {
+                    GitHubError::Api(format!("failed to create GitHub client: {error}"))
+                })?;
 
             let pr = octocrab
                 .pulls(&owner, &repo_name)
                 .create(&title, &branch, &base_branch)
                 .send()
                 .await
-                .map_err(|error| format!("failed to create pull request: {error}"))?;
+                .map_err(|error| {
+                    GitHubError::Api(format!("failed to create pull request: {error}"))
+                })?;
 
             let url = pr.html_url.map(|u| u.to_string()).unwrap_or_default();
             Ok(format!("created PR: {url}"))
@@ -767,15 +772,19 @@ pub(crate) fn resolve_pull_request_for_review(
     repo_slug: &str,
     reference: &str,
     github_token: Option<&str>,
-) -> Result<ReviewPullRequest, String> {
+) -> Result<ReviewPullRequest, GitHubError> {
     let reference = reference.trim();
     if reference.is_empty() {
-        return Err("pull request reference is required".to_owned());
+        return Err(GitHubError::Api(
+            "pull request reference is required".to_owned(),
+        ));
     }
 
     let token = crate::resolve_github_access_token(github_token).ok_or_else(|| {
-        "no GitHub token available; set GITHUB_TOKEN or authenticate with `gh auth login`"
-            .to_owned()
+        GitHubError::Auth(
+            "no GitHub token available; set GITHUB_TOKEN or authenticate with `gh auth login`"
+                .to_owned(),
+        )
     })?;
 
     if let Some(pr_number) = parse_pull_request_number(reference) {
@@ -790,10 +799,10 @@ fn resolve_pull_request_for_review_by_branch(
     repo_slug: &str,
     branch: &str,
     token: &str,
-) -> Result<ReviewPullRequest, String> {
+) -> Result<ReviewPullRequest, GitHubError> {
     let (owner, repo_name) = repo_slug
         .split_once('/')
-        .ok_or_else(|| format!("invalid repository slug: {repo_slug}"))?;
+        .ok_or_else(|| GitHubError::Api(format!("invalid repository slug: {repo_slug}")))?;
 
     let owner = owner.to_owned();
     let repo_name = repo_name.to_owned();
@@ -801,13 +810,15 @@ fn resolve_pull_request_for_review_by_branch(
     let token = token.to_owned();
 
     let runtime = tokio::runtime::Runtime::new()
-        .map_err(|error| format!("failed to create runtime: {error}"))?;
+        .map_err(|error| GitHubError::Api(format!("failed to create runtime: {error}")))?;
 
     runtime.block_on(async move {
         let octocrab = octocrab::Octocrab::builder()
             .personal_token(token)
             .build()
-            .map_err(|error| format!("failed to create GitHub client: {error}"))?;
+            .map_err(|error| {
+                GitHubError::Api(format!("failed to create GitHub client: {error}"))
+            })?;
 
         let page = octocrab
             .pulls(&owner, &repo_name)
@@ -818,13 +829,14 @@ fn resolve_pull_request_for_review_by_branch(
             .send()
             .await
             .map_err(|error| {
-                format!("failed to look up pull request for branch '{branch}': {error}")
+                GitHubError::Api(format!(
+                    "failed to look up pull request for branch '{branch}': {error}"
+                ))
             })?;
 
-        let pr = page
-            .items
-            .first()
-            .ok_or_else(|| format!("no open pull request found for branch '{branch}'"))?;
+        let pr = page.items.first().ok_or_else(|| {
+            GitHubError::Api(format!("no open pull request found for branch '{branch}'"))
+        })?;
 
         Ok(ReviewPullRequest {
             number: pr.number,
@@ -840,30 +852,34 @@ fn resolve_pull_request_for_review_via_api(
     repo_slug: &str,
     pull_request_number: u64,
     token: &str,
-) -> Result<ReviewPullRequest, String> {
+) -> Result<ReviewPullRequest, GitHubError> {
     let (owner, repo_name) = repo_slug
         .split_once('/')
-        .ok_or_else(|| format!("invalid repository slug: {repo_slug}"))?;
+        .ok_or_else(|| GitHubError::Api(format!("invalid repository slug: {repo_slug}")))?;
 
     let owner = owner.to_owned();
     let repo_name = repo_name.to_owned();
     let token = token.to_owned();
 
     let runtime = tokio::runtime::Runtime::new()
-        .map_err(|error| format!("failed to create runtime: {error}"))?;
+        .map_err(|error| GitHubError::Api(format!("failed to create runtime: {error}")))?;
 
     runtime.block_on(async move {
         let octocrab = octocrab::Octocrab::builder()
             .personal_token(token)
             .build()
-            .map_err(|error| format!("failed to create GitHub client: {error}"))?;
+            .map_err(|error| {
+                GitHubError::Api(format!("failed to create GitHub client: {error}"))
+            })?;
 
         let pull_request = octocrab
             .pulls(&owner, &repo_name)
             .get(pull_request_number)
             .await
             .map_err(|error| {
-                format!("failed to resolve pull request #{pull_request_number}: {error}")
+                GitHubError::Api(format!(
+                    "failed to resolve pull request #{pull_request_number}: {error}"
+                ))
             })?;
 
         Ok(ReviewPullRequest {

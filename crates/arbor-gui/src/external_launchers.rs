@@ -1,9 +1,10 @@
-fn open_worktree_in_file_manager(worktree_path: &Path) -> Result<String, String> {
+fn open_worktree_in_file_manager(worktree_path: &Path) -> Result<String, LaunchError> {
     #[cfg(target_os = "macos")]
     {
         let mut command = create_command("open");
         command.arg(worktree_path);
-        run_launch_command(&mut command, "open worktree in Finder")?;
+        run_launch_command(&mut command, "open worktree in Finder")
+            .map_err(LaunchError::Failed)?;
         return Ok("opened worktree in Finder".to_owned());
     }
 
@@ -11,7 +12,8 @@ fn open_worktree_in_file_manager(worktree_path: &Path) -> Result<String, String>
     {
         let mut command = create_command("xdg-open");
         command.arg(worktree_path);
-        run_launch_command(&mut command, "open worktree in file manager")?;
+        run_launch_command(&mut command, "open worktree in file manager")
+            .map_err(LaunchError::Failed)?;
         return Ok("opened worktree in file manager".to_owned());
     }
 
@@ -19,18 +21,21 @@ fn open_worktree_in_file_manager(worktree_path: &Path) -> Result<String, String>
     {
         let mut command = create_command("explorer");
         command.arg(worktree_path);
-        run_launch_command(&mut command, "open worktree in File Explorer")?;
+        run_launch_command(&mut command, "open worktree in File Explorer")
+            .map_err(LaunchError::Failed)?;
         return Ok("opened worktree in File Explorer".to_owned());
     }
 
     #[allow(unreachable_code)]
-    Err("opening this worktree in a file manager is not supported on this platform".to_owned())
+    Err(LaunchError::Failed(
+        "opening this worktree in a file manager is not supported on this platform".to_owned(),
+    ))
 }
 
 fn open_worktree_with_external_launcher(
     worktree_path: &Path,
     launcher: ExternalLauncher,
-) -> Result<String, String> {
+) -> Result<String, LaunchError> {
     match launcher.kind {
         ExternalLauncherKind::Command(command_name) => {
             let mut command = create_command(command_name);
@@ -38,7 +43,8 @@ fn open_worktree_with_external_launcher(
             run_launch_command(
                 &mut command,
                 &format!("open worktree with {}", launcher.label),
-            )?;
+            )
+            .map_err(LaunchError::Failed)?;
         },
         ExternalLauncherKind::MacApp(app_name) => {
             let mut command = create_command("open");
@@ -46,7 +52,8 @@ fn open_worktree_with_external_launcher(
             run_launch_command(
                 &mut command,
                 &format!("open worktree in {}", launcher.label),
-            )?;
+            )
+            .map_err(LaunchError::Failed)?;
         },
     }
 
