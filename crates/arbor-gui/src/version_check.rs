@@ -4,8 +4,7 @@ use super::*;
 const VERSION_CHECK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// GitHub API endpoint for the latest release.
-const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/penso/arbor/releases/latest";
+const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/penso/arbor/releases/latest";
 
 /// Fetch the latest release tag from GitHub.
 ///

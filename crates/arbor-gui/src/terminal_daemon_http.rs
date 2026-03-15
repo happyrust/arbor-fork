@@ -221,6 +221,8 @@ pub struct AgentChatSessionSummary {
     pub status: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub transport_label: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,6 +255,14 @@ pub struct AgentChatMessageDto {
     pub content: String,
     #[serde(default)]
     pub tool_calls: Vec<String>,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub transport_label: Option<String>,
 }
 
 /// Events received over the agent chat WebSocket from the daemon.
@@ -287,6 +297,8 @@ pub enum AgentChatWsEvent {
         status: String,
         input_tokens: u64,
         output_tokens: u64,
+        #[serde(default)]
+        transport_label: Option<String>,
     },
     UserMessage {
         content: String,

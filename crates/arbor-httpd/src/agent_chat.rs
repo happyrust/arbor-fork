@@ -85,6 +85,9 @@ pub(crate) enum AgentChatEvent {
         status: AgentChatStatus,
         input_tokens: u64,
         output_tokens: u64,
+        /// Transport label for the session (e.g. "acp:claude", "openai:http://…").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport_label: Option<String>,
     },
     /// A complete user message (for history reconstruction).
     UserMessage { content: String },
@@ -98,6 +101,22 @@ pub(crate) struct ChatMessage {
     pub(crate) role: String,
     pub(crate) content: String,
     pub(crate) tool_calls: Vec<String>,
+    /// Per-turn input tokens (only set on assistant messages).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) input_tokens: u64,
+    /// Per-turn output tokens (only set on assistant messages).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) output_tokens: u64,
+    /// Model used for this turn (e.g. "claude-sonnet-4-20250514", "llama3.1:70b").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model_id: Option<String>,
+    /// Transport label for debugging (e.g. "acp:claude", "openai:http://localhost:11434/v1").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) transport_label: Option<String>,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// DTO for the agent chat session list endpoint.
@@ -109,6 +128,8 @@ pub(crate) struct AgentChatSessionDto {
     pub(crate) status: AgentChatStatus,
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
+    /// Human-readable transport label (e.g. "acp:claude", "openai:http://…").
+    pub(crate) transport_label: String,
 }
 
 /// Request to create a new agent chat session.
@@ -197,10 +218,27 @@ struct AgentChatSession {
     /// Tool calls accumulated during the current turn.
     pending_tool_calls: Vec<String>,
     status: AgentChatStatus,
+    /// Cumulative input tokens across all turns.
     input_tokens: u64,
+    /// Cumulative output tokens across all turns.
     output_tokens: u64,
+    /// Cumulative tokens at the start of the current turn (for per-turn delta).
+    turn_start_input_tokens: u64,
+    turn_start_output_tokens: u64,
     /// Handle to cancel a running turn.
     turn_cancel: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl AgentChatSession {
+    /// Human-readable transport label for debugging.
+    fn transport_label(&self) -> String {
+        match &self.transport {
+            AgentChatTransport::Acp => format!("acp:{}", self.agent_kind),
+            AgentChatTransport::OpenAiChat { base_url, .. } => {
+                format!("openai:{base_url}")
+            },
+        }
+    }
 }
 
 // ── Manager ──────────────────────────────────────────────────────────
@@ -209,6 +247,7 @@ struct AgentChatSession {
 pub(crate) struct AgentChatManager {
     sessions: HashMap<String, AgentChatSession>,
     http_client: reqwest::Client,
+    next_id: u64,
 }
 
 impl AgentChatManager {
@@ -216,20 +255,26 @@ impl AgentChatManager {
         Self {
             sessions: HashMap::new(),
             http_client: reqwest::Client::new(),
+            next_id: 0,
         }
     }
 
     /// Load previously persisted agent chat sessions from disk.
     /// Restored sessions are idle (no running process) but can accept new
     /// messages which will resume the underlying session.
-    pub(crate) fn load_persisted_sessions(&mut self) {
+    ///
+    /// Returns the list of `(session_id, event_rx)` pairs so the caller can
+    /// spawn background listeners for each restored session.
+    pub(crate) fn load_persisted_sessions(
+        &mut self,
+    ) -> Vec<(String, broadcast::Receiver<AgentChatEvent>)> {
         let path = agent_chat_store_path();
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
             Err(e) => {
                 tracing::warn!(%e, "failed to read agent chat store");
-                return;
+                return Vec::new();
             },
         };
 
@@ -237,9 +282,11 @@ impl AgentChatManager {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(%e, "failed to parse agent chat store");
-                return;
+                return Vec::new();
             },
         };
+
+        let mut restored = Vec::new();
 
         for record in records {
             // Skip sessions that are already loaded (shouldn't happen, but guard)
@@ -247,10 +294,11 @@ impl AgentChatManager {
                 continue;
             }
 
-            let (event_tx, _) = broadcast::channel::<AgentChatEvent>(256);
+            let (event_tx, event_rx) = broadcast::channel::<AgentChatEvent>(256);
+            let session_id = record.id.clone();
             let session = AgentChatSession {
                 id: record.id.clone(),
-                agent_kind: record.agent_kind,
+                agent_kind: record.agent_kind.clone(),
                 workspace_path: record.workspace_path,
                 session_name: record.session_name,
                 model_id: record.model_id,
@@ -262,15 +310,19 @@ impl AgentChatManager {
                 status: AgentChatStatus::Idle,
                 input_tokens: record.input_tokens,
                 output_tokens: record.output_tokens,
+                turn_start_input_tokens: record.input_tokens,
+                turn_start_output_tokens: record.output_tokens,
                 turn_cancel: None,
             };
             self.sessions.insert(record.id, session);
+            restored.push((session_id, event_rx));
         }
 
         tracing::info!(
             count = self.sessions.len(),
             "restored agent chat sessions from disk"
         );
+        restored
     }
 
     /// Persist all non-exited sessions to disk.
@@ -288,6 +340,10 @@ impl AgentChatManager {
                         role: "assistant".to_owned(),
                         content: s.pending_assistant_text.clone(),
                         tool_calls: s.pending_tool_calls.clone(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        model_id: s.model_id.clone(),
+                        transport_label: Some(s.transport_label()),
                     });
                 }
                 AgentChatRecord {
@@ -331,12 +387,15 @@ impl AgentChatManager {
         model_id: Option<String>,
         transport: Option<AgentChatTransport>,
     ) -> (String, broadcast::Receiver<AgentChatEvent>) {
+        let id_counter = self.next_id;
+        self.next_id += 1;
         let session_id = format!(
-            "agent-chat-{}",
+            "agent-chat-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis()
+                .as_millis(),
+            id_counter
         );
         let session_name = format!("arbor-{session_id}");
         let (event_tx, event_rx) = broadcast::channel::<AgentChatEvent>(256);
@@ -358,8 +417,20 @@ impl AgentChatManager {
             status: AgentChatStatus::Idle,
             input_tokens: 0,
             output_tokens: 0,
+            turn_start_input_tokens: 0,
+            turn_start_output_tokens: 0,
             turn_cancel: None,
         };
+
+        let label = session.transport_label();
+        tracing::info!(
+            session_id,
+            agent_kind,
+            workspace_path = %workspace_path.display(),
+            transport = %label,
+            model = ?session.model_id,
+            "created agent chat session"
+        );
 
         self.sessions.insert(session_id.clone(), session);
 
@@ -371,6 +442,10 @@ impl AgentChatManager {
                 role: "user".to_owned(),
                 content: prompt.clone(),
                 tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                model_id: None,
+                transport_label: None,
             });
             let _ = event_tx.send(AgentChatEvent::UserMessage {
                 content: prompt.clone(),
@@ -393,10 +468,22 @@ impl AgentChatManager {
             return Err("agent is already processing a turn".to_owned());
         }
 
+        tracing::info!(
+            session_id,
+            transport = %session.transport_label(),
+            model = ?session.model_id,
+            message_len = message.len(),
+            "sending message to agent chat"
+        );
+
         session.messages.push(ChatMessage {
             role: "user".to_owned(),
             content: message.clone(),
             tool_calls: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            model_id: None,
+            transport_label: None,
         });
         let _ = session.event_tx.send(AgentChatEvent::UserMessage {
             content: message.clone(),
@@ -458,6 +545,7 @@ impl AgentChatManager {
                 status: s.status,
                 input_tokens: s.input_tokens,
                 output_tokens: s.output_tokens,
+                transport_label: s.transport_label(),
             })
             .collect()
     }
@@ -476,6 +564,10 @@ impl AgentChatManager {
                 role: "assistant".to_owned(),
                 content: session.pending_assistant_text.clone(),
                 tool_calls: session.pending_tool_calls.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+                model_id: session.model_id.clone(),
+                transport_label: Some(session.transport_label()),
             });
         }
         Ok(messages)
@@ -506,6 +598,7 @@ impl AgentChatManager {
                 status: session.status,
                 input_tokens: session.input_tokens,
                 output_tokens: session.output_tokens,
+                transport_label: session.transport_label(),
             },
             session.messages.clone(),
         ))
@@ -686,7 +779,12 @@ async fn run_turn_acpx(
             line_result = lines.next_line() => {
                 match line_result {
                     Ok(Some(line)) => {
-                        if let Some(event) = parse_acpx_event(&line) {
+                        let events = parse_acpx_events(&line);
+                        if events.is_empty() {
+                            tracing::trace!(line, "acpx line produced no events");
+                        }
+                        for event in events {
+                            tracing::trace!(?event, "acpx event");
                             // Accumulate assistant text for history
                             if let AgentChatEvent::MessageChunk { ref content } = event {
                                 assistant_text.push_str(content);
@@ -1051,14 +1149,24 @@ fn which_acpx() -> String {
 ///
 /// Mirrors polyphony's `parse_acpx_prompt_event_line` in
 /// `crates/agent-acpx/src/lib.rs:479-526`.
-fn parse_acpx_event(line: &str) -> Option<AgentChatEvent> {
+/// Parse a single JSONL line from acpx output into zero or more events.
+///
+/// Returns a primary event (if recognized) and optionally a `UsageUpdate` if
+/// token counts are found anywhere in the line's JSON (they can appear embedded
+/// in various events, not just `usage_update`).
+fn parse_acpx_events(line: &str) -> Vec<AgentChatEvent> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    let parsed: Value = serde_json::from_str(trimmed).ok()?;
-    let object = parsed.as_object()?;
+    let parsed: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(object) = parsed.as_object() else {
+        return Vec::new();
+    };
 
     // Handle JSON-RPC error responses (e.g. "no session found")
     if let Some(error_obj) = object.get("error").and_then(Value::as_object) {
@@ -1067,12 +1175,19 @@ fn parse_acpx_event(line: &str) -> Option<AgentChatEvent> {
             .and_then(Value::as_str)
             .unwrap_or("unknown JSON-RPC error")
             .to_owned();
-        return Some(AgentChatEvent::Error { message });
+        return vec![AgentChatEvent::Error { message }];
     }
 
     // Handle ACP session/update wrapper
     let payload = if object.get("method").and_then(Value::as_str) == Some("session/update") {
-        object.get("params")?.get("update")?.as_object()?.clone()
+        match object
+            .get("params")
+            .and_then(|p| p.get("update"))
+            .and_then(Value::as_object)
+        {
+            Some(p) => p.clone(),
+            None => return Vec::new(),
+        }
     } else {
         object.clone()
     };
@@ -1083,12 +1198,18 @@ fn parse_acpx_event(line: &str) -> Option<AgentChatEvent> {
         .or_else(|| payload.get("type").and_then(Value::as_str))
         .unwrap_or_default();
 
+    let mut events = Vec::new();
+
     match tag {
         "text" | "agent_message_chunk" => {
-            extract_text(&payload).map(|content| AgentChatEvent::MessageChunk { content })
+            if let Some(content) = extract_text(&payload) {
+                events.push(AgentChatEvent::MessageChunk { content });
+            }
         },
         "thought" | "agent_thought_chunk" => {
-            extract_text(&payload).map(|content| AgentChatEvent::ThoughtChunk { content })
+            if let Some(content) = extract_text(&payload) {
+                events.push(AgentChatEvent::ThoughtChunk { content });
+            }
         },
         "tool_call" | "tool_call_update" => {
             let name = payload
@@ -1101,33 +1222,24 @@ fn parse_acpx_event(line: &str) -> Option<AgentChatEvent> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
-            Some(AgentChatEvent::ToolCall { name, status })
+            events.push(AgentChatEvent::ToolCall { name, status });
         },
         "usage_update" => {
-            // Try to extract token counts from the payload
-            let input_tokens = payload
-                .get("usage")
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output_tokens = payload
-                .get("usage")
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            Some(AgentChatEvent::UsageUpdate {
-                input_tokens,
-                output_tokens,
-            })
+            // Log the raw payload so we can see what acpx actually sends
+            let raw = serde_json::to_string(&Value::Object(payload.clone())).unwrap_or_default();
+            tracing::debug!(raw, "acpx usage_update raw payload");
+            // Extraction handled below
         },
-        "done" => None, // Handled by process exit
+        "done" => {
+            // Handled by process exit — but may contain usage, checked below
+        },
         "error" => {
             let message = payload
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("agent error")
                 .to_owned();
-            Some(AgentChatEvent::Error { message })
+            events.push(AgentChatEvent::Error { message });
         },
         "current_mode_update"
         | "config_option_update"
@@ -1137,10 +1249,24 @@ fn parse_acpx_event(line: &str) -> Option<AgentChatEvent> {
         | "client_operation"
         | "update" => {
             let message = extract_text(&payload).unwrap_or_else(|| tag.replace('_', " "));
-            Some(AgentChatEvent::StatusUpdate { message })
+            events.push(AgentChatEvent::StatusUpdate { message });
         },
-        _ => None,
+        _ => {},
     }
+
+    // Try to extract usage from anywhere in the full JSON (not just the
+    // unwrapped payload). Token counts can appear at many different paths
+    // depending on the agent and protocol version.
+    let usage = extract_usage_from_value(&parsed)
+        .or_else(|| extract_usage_from_value(&Value::Object(payload)));
+    if let Some((input_tokens, output_tokens)) = usage {
+        events.push(AgentChatEvent::UsageUpdate {
+            input_tokens,
+            output_tokens,
+        });
+    }
+
+    events
 }
 
 /// Extract text content from a payload, checking multiple field paths.
@@ -1168,6 +1294,61 @@ fn extract_text(payload: &serde_json::Map<String, Value>) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })
+}
+
+/// Try to extract `(input_tokens, output_tokens)` from a JSON value by
+/// probing many possible paths that different agents use.
+///
+/// Mirrors the extraction logic from polyphony's `agent-codex` module which
+/// checks paths like `params/token_counts/total_token_usage`,
+/// `params/tokenUsage`, `params/usage`, `usage`, and both snake_case and
+/// camelCase field names.
+fn extract_usage_from_value(value: &Value) -> Option<(u64, u64)> {
+    // JSON Pointer paths where absolute token usage may appear
+    static USAGE_POINTERS: &[&str] = &[
+        "/params/token_counts/total_token_usage",
+        "/params/token_counts/totalTokenUsage",
+        "/result/token_counts/total_token_usage",
+        "/result/token_counts/totalTokenUsage",
+        "/params/total_token_usage",
+        "/params/totalTokenUsage",
+        "/result/total_token_usage",
+        "/result/totalTokenUsage",
+        "/params/token_usage",
+        "/params/tokenUsage",
+        "/result/token_usage",
+        "/result/tokenUsage",
+        "/params/usage",
+        "/result/usage",
+        "/usage",
+        // Inside the unwrapped payload (for session/update wrapper)
+        "/tokenUsage",
+        "/token_usage",
+    ];
+
+    for pointer in USAGE_POINTERS {
+        if let Some(usage_obj) = value.pointer(pointer)
+            && let Some(pair) = parse_token_pair(usage_obj)
+        {
+            return Some(pair);
+        }
+    }
+    // As a last resort, try parsing the value itself (top-level fields)
+    parse_token_pair(value)
+}
+
+/// Parse `(input_tokens, output_tokens)` from a usage object, accepting both
+/// snake_case and camelCase field names.
+fn parse_token_pair(obj: &Value) -> Option<(u64, u64)> {
+    let input = obj
+        .get("input_tokens")
+        .or_else(|| obj.get("inputTokens"))
+        .and_then(Value::as_u64)?;
+    let output = obj
+        .get("output_tokens")
+        .or_else(|| obj.get("outputTokens"))
+        .and_then(Value::as_u64)?;
+    Some((input, output))
 }
 
 // ── Background event listener ────────────────────────────────────────
@@ -1206,10 +1387,36 @@ pub(crate) fn spawn_session_listener(
                             if !session.pending_assistant_text.is_empty() {
                                 let text = std::mem::take(&mut session.pending_assistant_text);
                                 let tools = std::mem::take(&mut session.pending_tool_calls);
+                                let turn_input = session
+                                    .input_tokens
+                                    .saturating_sub(session.turn_start_input_tokens);
+                                let mut turn_output = session
+                                    .output_tokens
+                                    .saturating_sub(session.turn_start_output_tokens);
+                                // If usage delta is zero, estimate from text length
+                                // (~4 chars per token).
+                                if turn_output == 0 && !text.is_empty() {
+                                    turn_output = (text.len() as u64).div_ceil(4);
+                                }
+                                tracing::debug!(
+                                    session_id,
+                                    cumulative_in = session.input_tokens,
+                                    cumulative_out = session.output_tokens,
+                                    turn_start_in = session.turn_start_input_tokens,
+                                    turn_start_out = session.turn_start_output_tokens,
+                                    turn_input,
+                                    turn_output,
+                                    text_len = text.len(),
+                                    "finalizing assistant message with per-turn tokens"
+                                );
                                 session.messages.push(ChatMessage {
                                     role: "assistant".to_owned(),
                                     content: text,
                                     tool_calls: tools,
+                                    input_tokens: turn_input,
+                                    output_tokens: turn_output,
+                                    model_id: session.model_id.clone(),
+                                    transport_label: Some(session.transport_label()),
                                 });
                             }
                             session.status = AgentChatStatus::Idle;
@@ -1220,10 +1427,23 @@ pub(crate) fn spawn_session_listener(
                             if !session.pending_assistant_text.is_empty() {
                                 let text = std::mem::take(&mut session.pending_assistant_text);
                                 let tools = std::mem::take(&mut session.pending_tool_calls);
+                                let turn_input = session
+                                    .input_tokens
+                                    .saturating_sub(session.turn_start_input_tokens);
+                                let mut turn_output = session
+                                    .output_tokens
+                                    .saturating_sub(session.turn_start_output_tokens);
+                                if turn_output == 0 && !text.is_empty() {
+                                    turn_output = (text.len() as u64).div_ceil(4);
+                                }
                                 session.messages.push(ChatMessage {
                                     role: "assistant".to_owned(),
                                     content: text,
                                     tool_calls: tools,
+                                    input_tokens: turn_input,
+                                    output_tokens: turn_output,
+                                    model_id: session.model_id.clone(),
+                                    transport_label: Some(session.transport_label()),
                                 });
                             } else {
                                 session.pending_assistant_text.clear();
@@ -1233,6 +1453,10 @@ pub(crate) fn spawn_session_listener(
                                 role: "error".to_owned(),
                                 content: message.clone(),
                                 tool_calls: Vec::new(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                model_id: None,
+                                transport_label: None,
                             });
                             session.status = AgentChatStatus::Idle;
                             mgr.persist();
@@ -1246,12 +1470,24 @@ pub(crate) fn spawn_session_listener(
                             input_tokens,
                             output_tokens,
                         } => {
+                            tracing::debug!(
+                                session_id,
+                                input_tokens,
+                                output_tokens,
+                                prev_input = session.input_tokens,
+                                prev_output = session.output_tokens,
+                                "usage update received (cumulative overwrite)"
+                            );
+                            // Values are cumulative totals (e.g. from acpx
+                            // total_token_usage). Overwrite, not accumulate.
                             session.input_tokens = *input_tokens;
                             session.output_tokens = *output_tokens;
                         },
                         AgentChatEvent::TurnStarted => {
                             session.pending_assistant_text.clear();
                             session.pending_tool_calls.clear();
+                            session.turn_start_input_tokens = session.input_tokens;
+                            session.turn_start_output_tokens = session.output_tokens;
                             session.status = AgentChatStatus::Working;
                         },
                         _ => {},
@@ -1282,7 +1518,7 @@ mod tests {
     #[test]
     fn parse_message_chunk() {
         let line = r#"{"type":"agent_message_chunk","content":{"type":"text","text":"Hello"}}"#;
-        let event = parse_acpx_event(line).unwrap();
+        let event = parse_acpx_events(line).into_iter().next().unwrap();
         match event {
             AgentChatEvent::MessageChunk { content } => assert_eq!(content, "Hello"),
             other => panic!("expected MessageChunk, got {other:?}"),
@@ -1293,7 +1529,7 @@ mod tests {
     fn parse_thought_chunk() {
         let line =
             r#"{"type":"agent_thought_chunk","content":{"type":"text","text":"thinking..."}}"#;
-        let event = parse_acpx_event(line).unwrap();
+        let event = parse_acpx_events(line).into_iter().next().unwrap();
         match event {
             AgentChatEvent::ThoughtChunk { content } => assert_eq!(content, "thinking..."),
             other => panic!("expected ThoughtChunk, got {other:?}"),
@@ -1303,7 +1539,7 @@ mod tests {
     #[test]
     fn parse_tool_call() {
         let line = r#"{"type":"tool_call","title":"Read file","status":"completed"}"#;
-        let event = parse_acpx_event(line).unwrap();
+        let event = parse_acpx_events(line).into_iter().next().unwrap();
         match event {
             AgentChatEvent::ToolCall { name, status } => {
                 assert_eq!(name, "Read file");
@@ -1316,7 +1552,7 @@ mod tests {
     #[test]
     fn parse_error() {
         let line = r#"{"type":"error","message":"rate limited"}"#;
-        let event = parse_acpx_event(line).unwrap();
+        let event = parse_acpx_events(line).into_iter().next().unwrap();
         match event {
             AgentChatEvent::Error { message } => assert_eq!(message, "rate limited"),
             other => panic!("expected Error, got {other:?}"),
@@ -1326,22 +1562,64 @@ mod tests {
     #[test]
     fn parse_done_returns_none() {
         let line = r#"{"type":"done"}"#;
-        assert!(parse_acpx_event(line).is_none());
+        assert!(parse_acpx_events(line).is_empty());
     }
 
     #[test]
     fn parse_empty_line_returns_none() {
-        assert!(parse_acpx_event("").is_none());
-        assert!(parse_acpx_event("  ").is_none());
+        assert!(parse_acpx_events("").is_empty());
+        assert!(parse_acpx_events("  ").is_empty());
     }
 
     #[test]
     fn parse_session_update_wrapper() {
         let line = r#"{"method":"session/update","params":{"update":{"type":"agent_message_chunk","content":"hi"}}}"#;
-        let event = parse_acpx_event(line).unwrap();
+        let event = parse_acpx_events(line).into_iter().next().unwrap();
         match event {
             AgentChatEvent::MessageChunk { content } => assert_eq!(content, "hi"),
             other => panic!("expected MessageChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_acpx_usage_in_params() {
+        // Token usage embedded in params/tokenUsage (Claude-style)
+        let line = r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"inputTokens":21,"outputTokens":13,"totalTokens":34}}}"#;
+        let events = parse_acpx_events(line);
+        let usage = events
+            .iter()
+            .find(|e| matches!(e, AgentChatEvent::UsageUpdate { .. }))
+            .expect("expected UsageUpdate");
+        match usage {
+            AgentChatEvent::UsageUpdate {
+                input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(*input_tokens, 21);
+                assert_eq!(*output_tokens, 13);
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn parse_acpx_usage_total_token_usage() {
+        // Token usage at params/token_counts/total_token_usage (Codex-style)
+        let line = r#"{"method":"notification","params":{"token_counts":{"total_token_usage":{"input_tokens":55,"output_tokens":34,"total_tokens":89}}}}"#;
+        let events = parse_acpx_events(line);
+        let usage = events
+            .iter()
+            .find(|e| matches!(e, AgentChatEvent::UsageUpdate { .. }))
+            .expect("expected UsageUpdate");
+        match usage {
+            AgentChatEvent::UsageUpdate {
+                input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(*input_tokens, 55);
+                assert_eq!(*output_tokens, 34);
+            },
+            _ => unreachable!(),
         }
     }
 
@@ -1378,5 +1656,189 @@ mod tests {
         let json = serde_json::to_string(&openai).unwrap();
         assert!(json.contains("\"type\":\"open_ai_chat\""));
         assert!(json.contains("localhost:11434"));
+    }
+
+    #[test]
+    fn transport_label_acp() {
+        let session = AgentChatSession {
+            id: "test-1".to_owned(),
+            agent_kind: "copilot".to_owned(),
+            workspace_path: PathBuf::from("/tmp"),
+            session_name: "test-session".to_owned(),
+            model_id: Some("copilot".to_owned()),
+            transport: AgentChatTransport::Acp,
+            event_tx: broadcast::channel::<AgentChatEvent>(16).0,
+            messages: Vec::new(),
+            pending_assistant_text: String::new(),
+            pending_tool_calls: Vec::new(),
+            status: AgentChatStatus::Idle,
+            input_tokens: 0,
+            output_tokens: 0,
+            turn_start_input_tokens: 0,
+            turn_start_output_tokens: 0,
+            turn_cancel: None,
+        };
+        assert_eq!(session.transport_label(), "acp:copilot");
+    }
+
+    #[test]
+    fn transport_label_openai() {
+        let session = AgentChatSession {
+            id: "test-2".to_owned(),
+            agent_kind: "ollama".to_owned(),
+            workspace_path: PathBuf::from("/tmp"),
+            session_name: "test-session".to_owned(),
+            model_id: Some("llama3:8b".to_owned()),
+            transport: AgentChatTransport::OpenAiChat {
+                base_url: "http://localhost:11434/v1".to_owned(),
+                api_key: None,
+            },
+            event_tx: broadcast::channel::<AgentChatEvent>(16).0,
+            messages: Vec::new(),
+            pending_assistant_text: String::new(),
+            pending_tool_calls: Vec::new(),
+            status: AgentChatStatus::Idle,
+            input_tokens: 0,
+            output_tokens: 0,
+            turn_start_input_tokens: 0,
+            turn_start_output_tokens: 0,
+            turn_cancel: None,
+        };
+        assert_eq!(
+            session.transport_label(),
+            "openai:http://localhost:11434/v1"
+        );
+    }
+
+    #[test]
+    fn create_session_sets_correct_agent_kind() {
+        let mut manager = AgentChatManager::new();
+
+        // Create a session with copilot agent kind
+        let (session_id, _rx) = manager.create_session(
+            "copilot".to_owned(),
+            PathBuf::from("/tmp/test"),
+            None,
+            Some("copilot".to_owned()),
+            None, // defaults to ACP
+        );
+
+        let sessions = manager.list();
+        let session = sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(session.agent_kind, "copilot");
+        assert_eq!(session.transport_label, "acp:copilot");
+    }
+
+    #[test]
+    fn create_session_with_openai_transport() {
+        let mut manager = AgentChatManager::new();
+
+        let (session_id, _rx) = manager.create_session(
+            "ollama".to_owned(),
+            PathBuf::from("/tmp/test"),
+            None,
+            Some("llama3:8b".to_owned()),
+            Some(AgentChatTransport::OpenAiChat {
+                base_url: "http://localhost:11434/v1".to_owned(),
+                api_key: None,
+            }),
+        );
+
+        let sessions = manager.list();
+        let session = sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(session.agent_kind, "ollama");
+        assert_eq!(session.transport_label, "openai:http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn create_session_default_transport_is_acp() {
+        let mut manager = AgentChatManager::new();
+
+        let (session_id, _rx) = manager.create_session(
+            "claude".to_owned(),
+            PathBuf::from("/tmp/test"),
+            None,
+            None,
+            None, // no transport → default ACP
+        );
+
+        let sessions = manager.list();
+        let session = sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(session.transport_label, "acp:claude");
+    }
+
+    #[test]
+    fn switching_agent_creates_separate_sessions() {
+        let mut manager = AgentChatManager::new();
+
+        // First session: claude
+        let (id1, _rx1) = manager.create_session(
+            "claude".to_owned(),
+            PathBuf::from("/tmp/test"),
+            None,
+            None,
+            None,
+        );
+
+        // Second session: copilot (simulates what happens when user switches)
+        let (id2, _rx2) = manager.create_session(
+            "copilot".to_owned(),
+            PathBuf::from("/tmp/test"),
+            None,
+            Some("copilot".to_owned()),
+            None,
+        );
+
+        assert_ne!(id1, id2);
+
+        let sessions = manager.list();
+        let s1 = sessions.iter().find(|s| s.id == id1).unwrap();
+        let s2 = sessions.iter().find(|s| s.id == id2).unwrap();
+
+        assert_eq!(s1.agent_kind, "claude");
+        assert_eq!(s1.transport_label, "acp:claude");
+        assert_eq!(s2.agent_kind, "copilot");
+        assert_eq!(s2.transport_label, "acp:copilot");
+    }
+
+    #[test]
+    fn kill_and_remove_session() {
+        let mut manager = AgentChatManager::new();
+
+        let (session_id, _rx) = manager.create_session(
+            "claude".to_owned(),
+            PathBuf::from("/tmp/test"),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(manager.list().len(), 1);
+
+        // Kill marks it exited
+        manager.kill(&session_id).unwrap();
+        let sessions = manager.list();
+        assert_eq!(sessions[0].status, AgentChatStatus::Exited);
+
+        // Remove deletes it
+        manager.remove(&session_id);
+        assert!(manager.list().is_empty());
+    }
+
+    #[test]
+    fn session_snapshot_includes_transport_label() {
+        let mut manager = AgentChatManager::new();
+
+        let (session_id, _rx) = manager.create_session(
+            "copilot".to_owned(),
+            PathBuf::from("/tmp/test"),
+            None,
+            Some("copilot".to_owned()),
+            None,
+        );
+
+        let (_rx, dto, _messages) = manager.subscribe(&session_id).unwrap();
+        assert_eq!(dto.transport_label, "acp:copilot");
+        assert_eq!(dto.agent_kind, "copilot");
     }
 }

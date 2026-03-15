@@ -482,7 +482,7 @@ impl ArborWindow {
                         label[..1].make_ascii_uppercase();
                         label
                     })
-                    .unwrap_or_else(|| "agent".to_owned());
+                    .unwrap_or_else(|| "Agent".to_owned());
                 (icon, label, true)
             },
             CenterTab::Logs => (
@@ -845,12 +845,12 @@ impl ArborWindow {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(theme.text_primary))
-                                    .child("Agent Chat"),
+                                    .child("Agent Chat (alpha)"),
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.new_tab_menu_position = None;
                                 // Default to Claude; user can change agent in the composer
-                                this.spawn_agent_chat(AgentPresetKind::Claude, cx);
+                                this.spawn_agent_chat(AgentPresetKind::Claude, None, cx);
                             })),
                     ),
             )
@@ -901,7 +901,23 @@ fn render_agent_chat_content(
             .map(|k| k.label().to_owned())
             .unwrap_or_else(|| session.agent_kind.clone())
     };
-    let token_text = format_token_count(session.input_tokens, session.output_tokens);
+    // Sum per-message tokens for accurate totals (includes char-based estimates).
+    // Fall back to session-level cumulative if no per-message data exists.
+    let (total_in, total_out) = {
+        let (msg_in, msg_out) = session
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .fold((0u64, 0u64), |(ai, ao), m| {
+                (ai + m.input_tokens, ao + m.output_tokens)
+            });
+        if msg_in > 0 || msg_out > 0 {
+            (msg_in, msg_out)
+        } else {
+            (session.input_tokens, session.output_tokens)
+        }
+    };
+    let token_text = format_token_count_with_total(total_in, total_out);
     let show_agent_selector = agent_selector_open_for == Some(local_id);
     let show_mode_selector = chat_mode_selector_open_for == Some(local_id);
 
@@ -932,21 +948,33 @@ fn render_agent_chat_content(
                         .flex_col()
                         .gap_4()
                         .children({
-                            let input_tokens = session.input_tokens;
-                            let output_tokens = session.output_tokens;
+                            let msg_count = session.messages.len();
+                            // Find the index of the last assistant message
+                            let last_assistant_idx = session
+                                .messages
+                                .iter()
+                                .rposition(|m| m.role == "assistant");
+                            let session_input = total_in;
+                            let session_output = total_out;
+                            let streaming_info = if is_working {
+                                Some((session.turn_streamed_chars, session.turn_start_time))
+                            } else {
+                                None
+                            };
                             session.messages.iter().enumerate().map(
                                 move |(i, msg)| {
-                                    // Show token counts on the last assistant message
-                                    let is_last_assistant = msg.role == "assistant"
-                                        && !session.messages[i + 1..]
-                                            .iter()
-                                            .any(|m| m.role == "assistant");
-                                    let tokens = if is_last_assistant {
-                                        Some((input_tokens, output_tokens))
-                                    } else {
-                                        None
-                                    };
-                                    render_chat_message(msg, i, tokens, theme)
+                                    let is_last_assistant =
+                                        last_assistant_idx == Some(i);
+                                    render_chat_message(
+                                        msg,
+                                        i,
+                                        msg_count,
+                                        is_last_assistant,
+                                        session_input,
+                                        session_output,
+                                        streaming_info,
+                                        theme,
+                                    )
                                 },
                             )
                         })
@@ -1206,17 +1234,15 @@ fn render_agent_selector_popup(
                                     this.agent_selector_open_for = None;
                                     this.agent_selector_search.clear();
                                     this.agent_selector_search_cursor = 0;
-                                    if let Some(session) = this
-                                        .agent_chat_sessions
-                                        .iter_mut()
-                                        .find(|s| s.local_id == local_id)
-                                    {
-                                        session.agent_kind =
-                                            model_provider.key().to_owned();
-                                        session.selected_model_id =
-                                            Some(model_id.to_owned());
-                                    }
-                                    cx.notify();
+                                    // Kill the current session and create a new
+                                    // one with the correct agent kind + model so
+                                    // the daemon actually uses the right CLI.
+                                    this.close_agent_chat_by_local_id(local_id, cx);
+                                    this.spawn_agent_chat(
+                                        model_provider,
+                                        Some(model_id.to_owned()),
+                                        cx,
+                                    );
                                 }))
                                 .into_any_element()
                         },
@@ -1260,6 +1286,9 @@ fn render_agent_selector_popup(
                                     this.agent_selector_open_for = None;
                                     this.agent_selector_search.clear();
                                     this.agent_selector_search_cursor = 0;
+
+                                    // Close the current session first
+                                    this.close_agent_chat_by_local_id(local_id, cx);
 
                                     // Find the provider to get base_url and api_key
                                     let provider = this.configured_providers.iter()
@@ -1748,7 +1777,7 @@ fn render_empty_chat_state(model_label: &str, theme: ThemePalette) -> Div {
                 .text_lg()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(theme.text_primary))
-                .child(format!("{model_label} Chat")),
+                .child(format!("{model_label} Chat (alpha)")),
         )
         .child(
             div()
@@ -1795,11 +1824,81 @@ fn render_thinking_indicator(theme: ThemePalette) -> Div {
 fn render_chat_message(
     msg: &AgentChatMessage,
     index: usize,
-    session_tokens: Option<(u64, u64)>,
+    _msg_count: usize,
+    is_last_assistant: bool,
+    session_input_tokens: u64,
+    session_output_tokens: u64,
+    // When the session is working: `Some((turn_streamed_chars, turn_start_time))`.
+    streaming_info: Option<(usize, Option<Instant>)>,
     theme: ThemePalette,
 ) -> Stateful<Div> {
     let is_user = msg.role == "user";
     let is_error = msg.role == "error";
+    let is_assistant = !is_user && !is_error;
+    let is_streaming = streaming_info.is_some();
+
+    // Build footer parts for assistant messages (text + optional colored speed)
+    let footer_parts: Option<(String, Option<(String, u32)>)> = if is_assistant {
+        if msg.input_tokens > 0 || msg.output_tokens > 0 {
+            // Completed message with per-message token data
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(label) = &msg.transport_label {
+                parts.push(label.clone());
+            }
+            if let Some(model) = &msg.model_id {
+                parts.push(model.clone());
+            }
+            parts.push(format_token_count(msg.input_tokens, msg.output_tokens));
+            let speed = msg.tokens_per_sec.map(format_speed);
+            Some((parts.join(" · "), speed))
+        } else if is_last_assistant && is_streaming {
+            // Currently streaming — show live estimated token count
+            // Safe: we checked is_streaming above
+            let (streamed_chars, start_time) = streaming_info.unwrap_or((0, None));
+            let estimated_tokens = (streamed_chars / 4) as u64;
+            if estimated_tokens > 0 {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(label) = &msg.transport_label {
+                    parts.push(label.clone());
+                }
+                if let Some(model) = &msg.model_id {
+                    parts.push(model.clone());
+                }
+                parts.push(format!("~{} out", format_tokens(estimated_tokens)));
+                // Live speed estimate
+                let speed = start_time.and_then(|t| {
+                    let elapsed = t.elapsed().as_secs_f64();
+                    if elapsed > 0.5 {
+                        Some(format_speed(estimated_tokens as f64 / elapsed))
+                    } else {
+                        None
+                    }
+                });
+                Some((parts.join(" · "), speed))
+            } else {
+                None
+            }
+        } else if is_last_assistant && (session_input_tokens > 0 || session_output_tokens > 0) {
+            // Idle with session-level cumulative tokens (no per-message data yet)
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(label) = &msg.transport_label {
+                parts.push(label.clone());
+            }
+            if let Some(model) = &msg.model_id {
+                parts.push(model.clone());
+            }
+            parts.push(format_token_count_with_total(
+                session_input_tokens,
+                session_output_tokens,
+            ));
+            let speed = msg.tokens_per_sec.map(format_speed);
+            Some((parts.join(" · "), speed))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     div()
         .id(ElementId::Name(format!("chat-msg-{index}").into()))
@@ -1823,7 +1922,7 @@ fn render_chat_message(
                     this.bg(rgb(theme.panel_active_bg))
                         .text_color(rgb(theme.text_primary))
                 })
-                .when(!is_user && !is_error, |this| {
+                .when(is_assistant, |this| {
                     this.text_color(rgb(theme.text_primary))
                 })
                 .when(is_error, |this| {
@@ -1859,38 +1958,70 @@ fn render_chat_message(
                     })),
             )
         })
-        // Token footer on assistant messages
-        .when(
-            !is_user && !is_error && session_tokens.is_some(),
-            |this| {
-                let (input, output) = session_tokens.unwrap_or((0, 0));
-                if input > 0 || output > 0 {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(format_token_count(input, output)),
-                    )
-                } else {
-                    this
-                }
-            },
-        )
+        // Per-message token/transport footer on assistant messages
+        .children(footer_parts.map(|(text, speed)| {
+            div()
+                .flex()
+                .gap_1()
+                .text_xs()
+                .text_color(rgb(theme.text_muted))
+                .pt_1()
+                .child(text)
+                .children(speed.map(|(label, color)| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(color))
+                        .child(label)
+                }))
+        }))
+}
+
+/// Format speed as "X.Y tok/s" with a color based on performance.
+/// Green (≥50 tok/s), gray (20–50), red (<20).
+fn format_speed(tps: f64) -> (String, u32) {
+    let label = format!("{:.1} tok/s", tps);
+    let color = if tps >= 50.0 {
+        0x4ec96e // green — fast
+    } else if tps >= 20.0 {
+        0x888888 // gray — normal
+    } else {
+        0xc94040 // red — slow
+    };
+    (label, color)
 }
 
 fn format_token_count(input: u64, output: u64) -> String {
-    let fmt = |n: u64| -> String {
-        if n >= 1_000_000 {
-            format!("{:.1}M", n as f64 / 1_000_000.0)
-        } else if n >= 1_000 {
-            format!("{:.1}k", n as f64 / 1_000.0)
-        } else {
-            n.to_string()
-        }
-    };
     if input == 0 && output == 0 {
         String::new()
     } else {
-        format!("{} in / {} out", fmt(input), fmt(output))
+        format!(
+            "{} in / {} out",
+            format_tokens(input),
+            format_tokens(output)
+        )
+    }
+}
+
+fn format_token_count_with_total(input: u64, output: u64) -> String {
+    if input == 0 && output == 0 {
+        String::new()
+    } else {
+        let total = input + output;
+        format!(
+            "{} in / {} out · {} tokens",
+            format_tokens(input),
+            format_tokens(output),
+            format_tokens(total),
+        )
+    }
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }

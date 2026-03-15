@@ -170,12 +170,17 @@ export type AgentChatSession = {
   status: AgentChatStatus;
   input_tokens: number;
   output_tokens: number;
+  transport_label?: string;
 };
 
 export type ChatMessage = {
   role: string;
   content: string;
   tool_calls: string[];
+  input_tokens?: number;
+  output_tokens?: number;
+  model_id?: string | null;
+  transport_label?: string | null;
 };
 
 export type AgentChatEvent =
@@ -187,7 +192,7 @@ export type AgentChatEvent =
   | { type: "usage_update"; input_tokens: number; output_tokens: number }
   | { type: "error"; message: string }
   | { type: "session_exited"; exit_code: number | null }
-  | { type: "snapshot"; messages: ChatMessage[]; status: AgentChatStatus; input_tokens: number; output_tokens: number }
+  | { type: "snapshot"; messages: ChatMessage[]; status: AgentChatStatus; input_tokens: number; output_tokens: number; transport_label?: string | null }
   | { type: "user_message"; content: string }
   | { type: "status_update"; message: string };
 

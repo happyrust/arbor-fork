@@ -239,6 +239,9 @@ pub struct AgentChatSessionDto {
     pub status: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Human-readable transport label (e.g. "acp:claude", "openai:http://…").
+    #[serde(default)]
+    pub transport_label: String,
 }
 
 /// Transport used by an agent chat session.

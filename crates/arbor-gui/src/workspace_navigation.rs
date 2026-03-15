@@ -1018,6 +1018,20 @@ impl ArborWindow {
             .position(|s| s.local_id == local_id)
         {
             let session = self.agent_chat_sessions.remove(index);
+
+            // Select the previous tab in the tab bar instead of falling back
+            // to the first tab. Find the closed tab's position in the ordered
+            // tab list and pick the one before it (or after, if it was first).
+            let closed_tab = CenterTab::AgentChat(local_id);
+            if let Some(tab_pos) = self.center_tab_order.iter().position(|t| *t == closed_tab) {
+                let neighbor = if tab_pos > 0 {
+                    self.center_tab_order.get(tab_pos - 1).copied()
+                } else {
+                    self.center_tab_order.get(tab_pos + 1).copied()
+                };
+                self.activate_center_tab(neighbor, cx);
+            }
+
             // Remove from active tracking
             self.active_agent_chat_by_worktree
                 .retain(|_, id| *id != local_id);
@@ -1033,6 +1047,43 @@ impl ArborWindow {
             }
             cx.notify();
         }
+    }
+
+    /// Activate a specific center tab, clearing conflicting active state.
+    fn activate_center_tab(&mut self, tab: Option<CenterTab>, cx: &mut Context<Self>) {
+        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
+            return;
+        };
+        // Clear all active states first
+        self.logs_tab_active = false;
+        self.active_diff_session_id = None;
+        self.active_file_view_session_id = None;
+        self.active_agent_chat_by_worktree.remove(&worktree_path);
+        self.active_terminal_by_worktree.remove(&worktree_path);
+
+        match tab {
+            Some(CenterTab::Terminal(session_id)) => {
+                self.active_terminal_by_worktree
+                    .insert(worktree_path, session_id);
+            },
+            Some(CenterTab::Diff(diff_id)) => {
+                self.active_diff_session_id = Some(diff_id);
+            },
+            Some(CenterTab::FileView(fv_id)) => {
+                self.active_file_view_session_id = Some(fv_id);
+            },
+            Some(CenterTab::AgentChat(local_id)) => {
+                self.active_agent_chat_by_worktree
+                    .insert(worktree_path, local_id);
+            },
+            Some(CenterTab::Logs) => {
+                self.logs_tab_active = true;
+            },
+            None => {
+                // No neighbor — terminal fallback handled by render
+            },
+        }
+        self.sync_navigation_ui_state_store(cx);
     }
 
     pub(crate) fn select_agent_chat_tab(&mut self, local_id: u64, cx: &mut Context<Self>) {

@@ -1037,6 +1037,16 @@ pub(crate) struct AgentChatMessage {
     pub(crate) role: String,
     pub(crate) content: String,
     pub(crate) tool_calls: Vec<String>,
+    /// Per-turn input tokens (only meaningful for assistant messages).
+    pub(crate) input_tokens: u64,
+    /// Per-turn output tokens (only meaningful for assistant messages).
+    pub(crate) output_tokens: u64,
+    /// Output tokens per second for this turn.
+    pub(crate) tokens_per_sec: Option<f64>,
+    /// Model used for this turn.
+    pub(crate) model_id: Option<String>,
+    /// Transport label for debugging (e.g. "acp:claude", "openai:http://…").
+    pub(crate) transport_label: Option<String>,
 }
 
 /// Local state for an agent chat session displayed in the native GUI.
@@ -1065,6 +1075,16 @@ pub(crate) struct NativeAgentChatSession {
     pub(crate) input_tokens: u64,
     /// Cumulative output token usage.
     pub(crate) output_tokens: u64,
+    /// Cumulative input tokens at the start of the current turn (for delta).
+    pub(crate) turn_start_input_tokens: u64,
+    /// Cumulative output tokens at the start of the current turn (for delta).
+    pub(crate) turn_start_output_tokens: u64,
+    /// Wall-clock time when the current turn started (for speed calc).
+    pub(crate) turn_start_time: Option<Instant>,
+    /// Characters streamed during the current turn (for estimated token count).
+    pub(crate) turn_streamed_chars: usize,
+    /// Transport label from the daemon (e.g. "acp:claude", "openai:http://…").
+    pub(crate) transport_label: Option<String>,
     /// Permission mode for this chat session.
     pub(crate) chat_mode: AgentChatMode,
 }

@@ -570,7 +570,10 @@ fn discover_acpx_agents() -> Option<HashSet<AgentPresetKind>> {
         // Extract the first word (the subcommand name)
         let subcommand = trimmed.split_whitespace().next().unwrap_or("");
         // Skip non-agent subcommands (prompt, exec, cancel, set-mode, set, status, sessions, config)
-        if let Some(kind) = AgentPresetKind::from_key(subcommand) {
+        // Only include agents whose underlying CLI is actually installed.
+        if let Some(kind) = AgentPresetKind::from_key(subcommand)
+            && kind.is_installed()
+        {
             agents.insert(kind);
         }
     }

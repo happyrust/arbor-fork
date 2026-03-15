@@ -2620,6 +2620,7 @@ async fn handle_agent_chat_ws(mut socket: WebSocket, state: AppState, session_id
         status: session_dto.status,
         input_tokens: session_dto.input_tokens,
         output_tokens: session_dto.output_tokens,
+        transport_label: Some(session_dto.transport_label.clone()),
     };
     if let Ok(json) = serde_json::to_string(&snapshot) {
         let _ = socket.send(Message::Text(json.into())).await;

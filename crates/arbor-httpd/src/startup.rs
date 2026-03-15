@@ -132,17 +132,23 @@ pub(crate) async fn build_app_state(
         issue_service: Arc::new(issue_provider::RepositoryIssueService::default()),
         agent_sessions: Arc::new(Mutex::new(HashMap::new())),
         agent_broadcast,
-        agent_chat: {
-            let mut mgr = agent_chat::AgentChatManager::new();
-            mgr.load_persisted_sessions();
-            Arc::new(Mutex::new(mgr))
-        },
+        agent_chat: Arc::new(Mutex::new(agent_chat::AgentChatManager::new())),
         log_broadcast,
         pr_cache: Arc::new(Mutex::new(HashMap::new())),
         repo_cache: Arc::new(Mutex::new(HashMap::new())),
         shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         auth_state: auth_state.clone(),
     };
+
+    // Restore persisted agent chat sessions and spawn listeners
+    {
+        let mut mgr = state.agent_chat.lock().await;
+        let restored = mgr.load_persisted_sessions();
+        drop(mgr);
+        for (session_id, event_rx) in restored {
+            agent_chat::spawn_session_listener(state.agent_chat.clone(), session_id, event_rx);
+        }
+    }
 
     // Forward terminal activity events to agent sessions
     {

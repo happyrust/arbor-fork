@@ -2,7 +2,12 @@ use super::*;
 
 impl ArborWindow {
     /// Create a new agent chat session via the daemon and open it in a tab.
-    pub(crate) fn spawn_agent_chat(&mut self, kind: AgentPresetKind, cx: &mut Context<Self>) {
+    pub(crate) fn spawn_agent_chat(
+        &mut self,
+        kind: AgentPresetKind,
+        model_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
             self.notice = Some("No worktree selected".to_owned());
             cx.notify();
@@ -24,8 +29,14 @@ impl ArborWindow {
         let agent_kind_clone = agent_kind.clone();
 
         cx.spawn(async move |this, cx| {
-            let result =
-                daemon.create_agent_chat(&workspace_path_str, &agent_kind_clone, None, None, None);
+            let result = daemon.create_agent_chat(
+                &workspace_path_str,
+                &agent_kind_clone,
+                None,
+                model_id.as_deref(),
+                None,
+            );
+            let transport_label = Some(format!("acp:{agent_kind_clone}"));
             cx.update(|cx| {
                 this.update(cx, |this, cx| {
                     match result {
@@ -35,7 +46,7 @@ impl ArborWindow {
                                 local_id,
                                 session_id: response.session_id,
                                 agent_kind: agent_kind_clone,
-                                selected_model_id: None,
+                                selected_model_id: model_id,
                                 workspace_path: workspace_path_clone.clone(),
                                 status: "idle".to_owned(),
                                 messages: Vec::new(),
@@ -43,6 +54,11 @@ impl ArborWindow {
                                 input_cursor: 0,
                                 input_tokens: 0,
                                 output_tokens: 0,
+                                turn_start_input_tokens: 0,
+                                turn_start_output_tokens: 0,
+                                turn_start_time: None,
+                                turn_streamed_chars: 0,
+                                transport_label,
                                 chat_mode: AgentChatMode::default(),
                             };
                             this.agent_chat_sessions.push(session);
@@ -97,6 +113,14 @@ impl ArborWindow {
         let agent_kind_clone = agent_kind.clone();
 
         cx.spawn(async move |this, cx| {
+            let transport_label = Some(match &transport {
+                terminal_daemon_http::AgentChatTransport::Acp => {
+                    format!("acp:{}", agent_kind_clone)
+                },
+                terminal_daemon_http::AgentChatTransport::OpenAiChat { base_url, .. } => {
+                    format!("openai:{base_url}")
+                },
+            });
             let result = daemon.create_agent_chat(
                 &workspace_path_str,
                 &agent_kind_clone,
@@ -120,6 +144,11 @@ impl ArborWindow {
                             input_cursor: 0,
                             input_tokens: 0,
                             output_tokens: 0,
+                            turn_start_input_tokens: 0,
+                            turn_start_output_tokens: 0,
+                            turn_start_time: None,
+                            turn_streamed_chars: 0,
+                            transport_label,
                             chat_mode: AgentChatMode::default(),
                         };
                         this.agent_chat_sessions.push(session);
@@ -279,6 +308,11 @@ impl ArborWindow {
                 input_cursor: 0,
                 input_tokens: summary.input_tokens,
                 output_tokens: summary.output_tokens,
+                turn_start_input_tokens: summary.input_tokens,
+                turn_start_output_tokens: summary.output_tokens,
+                turn_start_time: None,
+                turn_streamed_chars: 0,
+                transport_label: summary.transport_label.clone(),
                 chat_mode: AgentChatMode::default(),
             };
 
@@ -476,10 +510,16 @@ impl ArborWindow {
             role: "user".to_owned(),
             content: message.clone(),
             tool_calls: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            tokens_per_sec: None,
+            model_id: None,
+            transport_label: None,
         });
         session.input_text.clear();
         session.input_cursor = 0;
         session.status = "working".to_owned();
+        self.agent_chat_scroll_handle.scroll_to_bottom();
         cx.notify();
 
         let Some(daemon) = self.terminal_daemon.clone() else {
@@ -661,6 +701,7 @@ impl ArborWindow {
                 status,
                 input_tokens,
                 output_tokens,
+                transport_label,
             } => {
                 session.messages = messages
                     .into_iter()
@@ -668,14 +709,25 @@ impl ArborWindow {
                         role: m.role,
                         content: m.content,
                         tool_calls: m.tool_calls,
+                        input_tokens: m.input_tokens,
+                        output_tokens: m.output_tokens,
+                        tokens_per_sec: None, // Not persisted, only live
+                        model_id: m.model_id,
+                        transport_label: m.transport_label,
                     })
                     .collect();
                 session.status = status;
                 session.input_tokens = input_tokens;
                 session.output_tokens = output_tokens;
+                if transport_label.is_some() {
+                    session.transport_label = transport_label;
+                }
+                self.agent_chat_scroll_handle.scroll_to_bottom();
                 cx.notify();
             },
             AgentChatWsEvent::MessageChunk { content } => {
+                // Track streamed characters for estimated token count
+                session.turn_streamed_chars += content.len();
                 // Append to the last assistant message, or create one
                 if let Some(last) = session.messages.last_mut() {
                     if last.role == "assistant" {
@@ -685,6 +737,11 @@ impl ArborWindow {
                             role: "assistant".to_owned(),
                             content,
                             tool_calls: Vec::new(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            tokens_per_sec: None,
+                            model_id: None,
+                            transport_label: None,
                         });
                     }
                 } else {
@@ -692,8 +749,14 @@ impl ArborWindow {
                         role: "assistant".to_owned(),
                         content,
                         tool_calls: Vec::new(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        tokens_per_sec: None,
+                        model_id: None,
+                        transport_label: None,
                     });
                 }
+                self.agent_chat_scroll_handle.scroll_to_bottom();
                 cx.notify();
             },
             AgentChatWsEvent::ToolCall { name, status } => {
@@ -707,10 +770,54 @@ impl ArborWindow {
                 cx.notify();
             },
             AgentChatWsEvent::TurnStarted => {
+                session.turn_start_input_tokens = session.input_tokens;
+                session.turn_start_output_tokens = session.output_tokens;
+                session.turn_start_time = Some(Instant::now());
+                session.turn_streamed_chars = 0;
                 session.status = "working".to_owned();
                 cx.notify();
             },
             AgentChatWsEvent::TurnCompleted => {
+                // Compute per-turn deltas from cumulative usage
+                let turn_input = session
+                    .input_tokens
+                    .saturating_sub(session.turn_start_input_tokens);
+                let mut turn_output = session
+                    .output_tokens
+                    .saturating_sub(session.turn_start_output_tokens);
+
+                // If the usage delta is zero but we streamed text, estimate
+                // output tokens from character count (~4 chars per token).
+                if turn_output == 0 && session.turn_streamed_chars > 0 {
+                    turn_output = (session.turn_streamed_chars as u64).div_ceil(4);
+                }
+
+                // Compute tokens/sec from wall-clock duration
+                let tps = session.turn_start_time.map(|start| {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    if elapsed > 0.0 {
+                        turn_output as f64 / elapsed
+                    } else {
+                        0.0
+                    }
+                });
+                if let Some(last) = session
+                    .messages
+                    .last_mut()
+                    .filter(|m| m.role == "assistant")
+                {
+                    last.input_tokens = turn_input;
+                    last.output_tokens = turn_output;
+                    last.tokens_per_sec = tps;
+                    if last.transport_label.is_none() {
+                        last.transport_label = session.transport_label.clone();
+                    }
+                    if last.model_id.is_none() {
+                        last.model_id = session.selected_model_id.clone();
+                    }
+                }
+                session.turn_start_time = None;
+                session.turn_streamed_chars = 0;
                 session.status = "idle".to_owned();
                 cx.notify();
             },
@@ -718,6 +825,7 @@ impl ArborWindow {
                 input_tokens,
                 output_tokens,
             } => {
+                // Cumulative totals from the daemon
                 session.input_tokens = input_tokens;
                 session.output_tokens = output_tokens;
                 cx.notify();
@@ -727,6 +835,11 @@ impl ArborWindow {
                     role: "error".to_owned(),
                     content: message,
                     tool_calls: Vec::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    tokens_per_sec: None,
+                    model_id: None,
+                    transport_label: None,
                 });
                 session.status = "idle".to_owned();
                 cx.notify();
@@ -747,6 +860,11 @@ impl ArborWindow {
                         role: "user".to_owned(),
                         content,
                         tool_calls: Vec::new(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        tokens_per_sec: None,
+                        model_id: None,
+                        transport_label: None,
                     });
                     cx.notify();
                 }
