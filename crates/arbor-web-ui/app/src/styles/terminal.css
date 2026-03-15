@@ -115,7 +115,7 @@
   font-size: 14px;
   line-height: 1;
   cursor: pointer;
-  color: var(--color-text-muted, #a1a1aa);
+  color: var(--text-muted);
 }
 
 .terminal-tab:hover .terminal-tab-close {
@@ -123,8 +123,8 @@
 }
 
 .terminal-tab-close:hover {
-  color: #f38ba8;
-  background: rgba(243, 139, 168, 0.15);
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 15%, transparent);
 }
 
 .preset-group {

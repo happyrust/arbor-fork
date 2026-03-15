@@ -319,50 +319,13 @@ pub(crate) fn parse_theme_kind(theme: Option<&str>) -> Result<ThemeKind, ConfigP
         return Ok(ThemeKind::One);
     };
 
-    match value.to_ascii_lowercase().as_str() {
-        "one-dark" | "onedark" => Ok(ThemeKind::One),
-        "ayu-dark" | "ayu" => Ok(ThemeKind::Ayu),
-        "gruvbox-dark" | "gruvbox" => Ok(ThemeKind::Gruvbox),
-        "dracula" => Ok(ThemeKind::Dracula),
-        "solarized-light" | "solarized" => Ok(ThemeKind::SolarizedLight),
-        "everforest-dark" | "everforest" => Ok(ThemeKind::Everforest),
-        "catppuccin" => Ok(ThemeKind::Catppuccin),
-        "catppuccin-latte" => Ok(ThemeKind::CatppuccinLatte),
-        "ethereal" => Ok(ThemeKind::Ethereal),
-        "flexoki-light" | "flexoki" => Ok(ThemeKind::FlexokiLight),
-        "hackerman" => Ok(ThemeKind::Hackerman),
-        "kanagawa" => Ok(ThemeKind::Kanagawa),
-        "matte-black" | "matteblack" => Ok(ThemeKind::MatteBlack),
-        "miasma" => Ok(ThemeKind::Miasma),
-        "nord" => Ok(ThemeKind::Nord),
-        "osaka-jade" | "osakajade" => Ok(ThemeKind::OsakaJade),
-        "ristretto" => Ok(ThemeKind::Ristretto),
-        "rose-pine" | "rosepine" => Ok(ThemeKind::RosePine),
-        "tokyo-night" | "tokyonight" => Ok(ThemeKind::TokyoNight),
-        "vantablack" => Ok(ThemeKind::Vantablack),
-        "white" => Ok(ThemeKind::White),
-        "atom-one-light" | "atomonelight" => Ok(ThemeKind::AtomOneLight),
-        "github-light-default" | "githublightdefault" => Ok(ThemeKind::GitHubLightDefault),
-        "github-light-high-contrast" | "githublighthighcontrast" => {
-            Ok(ThemeKind::GitHubLightHighContrast)
-        },
-        "github-light-colorblind" | "githublightcolorblind" => Ok(ThemeKind::GitHubLightColorblind),
-        "github-light" | "githublight" => Ok(ThemeKind::GitHubLight),
-        "github-dark-default" | "githubdarkdefault" => Ok(ThemeKind::GitHubDarkDefault),
-        "github-dark-high-contrast" | "githubdarkhighcontrast" => {
-            Ok(ThemeKind::GitHubDarkHighContrast)
-        },
-        "github-dark-colorblind" | "githubdarkcolorblind" => Ok(ThemeKind::GitHubDarkColorblind),
-        "github-dark-dimmed" | "githubdarkdimmed" => Ok(ThemeKind::GitHubDarkDimmed),
-        "github-dark" | "githubdark" => Ok(ThemeKind::GitHubDark),
-        "retrobox-classic" | "retrobox" => Ok(ThemeKind::RetroboxClassic),
-        "tokyonight-day" | "tokionight-day" => Ok(ThemeKind::TokyoNightDay),
-        "tokyonight-classic" | "tokionight-classic" => Ok(ThemeKind::TokyoNightClassic),
-        "zellner" => Ok(ThemeKind::Zellner),
-        _ => Err(ConfigParseError::InvalidValue(format!(
-            "invalid theme `{value}` in config, expected one-dark/ayu-dark/gruvbox-dark/dracula/solarized-light/everforest-dark/catppuccin/catppuccin-latte/ethereal/flexoki-light/hackerman/kanagawa/matte-black/miasma/nord/osaka-jade/ristretto/rose-pine/tokyo-night/vantablack/white/atom-one-light/github-light-default/github-light-high-contrast/github-light-colorblind/github-light/github-dark-default/github-dark-high-contrast/github-dark-colorblind/github-dark-dimmed/github-dark/retrobox-classic/tokyonight-day/tokyonight-classic/zellner"
-        ))),
-    }
+    ThemeKind::from_slug(value).ok_or_else(|| {
+        let slugs: Vec<&str> = ThemeKind::ALL.iter().map(|k| k.slug()).collect();
+        ConfigParseError::InvalidValue(format!(
+            "invalid theme `{value}` in config, expected {}",
+            slugs.join("/")
+        ))
+    })
 }
 
 #[cfg(test)]

@@ -9,12 +9,13 @@ import "./styles/status-bar.css";
 import "./styles/mobile.css";
 
 import { createSidebar } from "./components/sidebar";
-import { createTerminalPanel } from "./components/terminal-panel";
+import { createTerminalPanel, refreshTerminalTheme } from "./components/terminal-panel";
 import { createChangesPanel } from "./components/changes-panel";
 import { createCommandPalette } from "./components/command-palette";
 import { createWorktreeModal } from "./components/create-worktree-modal";
 import { createStatusBar } from "./components/status-bar";
 import { refresh, startAgentActivityWs } from "./state";
+import { fetchTheme, applyTheme } from "./api";
 
 const REFRESH_INTERVAL_MS = 5000;
 
@@ -100,9 +101,27 @@ function bootstrap(): void {
   setupResize(leftHandle, sidebar, "left");
   setupResize(rightHandle, changesPanel, "right");
 
+  // Apply theme from daemon config (non-blocking, falls back to CSS defaults)
+  void fetchTheme().then((theme) => {
+    if (theme !== null) {
+      applyTheme(theme);
+      refreshTerminalTheme(theme);
+    }
+  });
+
   // Initial data fetch
   void refresh();
   setInterval(() => { void refresh(); }, REFRESH_INTERVAL_MS);
+
+  // Periodically refresh theme (picks up changes from native app)
+  setInterval(() => {
+    void fetchTheme().then((theme) => {
+      if (theme !== null) {
+        applyTheme(theme);
+        refreshTerminalTheme(theme);
+      }
+    });
+  }, REFRESH_INTERVAL_MS);
 
   // Real-time agent activity
   startAgentActivityWs();

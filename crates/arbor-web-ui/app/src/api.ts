@@ -15,6 +15,8 @@ import type {
   IssueSource,
   ManagedWorktreePreview,
   WorktreeMutationResponse,
+  ThemeResponse,
+  ThemePalette,
   WsServerEvent,
   WsClientEvent,
 } from "./types";
@@ -511,4 +513,111 @@ export async function killTerminal(sessionId: string): Promise<void> {
     method: "DELETE",
     headers: { Accept: "application/json" },
   });
+}
+
+// ── Theme ────────────────────────────────────────────────────────────
+
+const THEME_PALETTE_KEYS: (keyof ThemePalette)[] = [
+  "chrome_bg", "chrome_border", "app_bg", "sidebar_bg", "terminal_bg",
+  "panel_bg", "panel_active_bg", "tab_bg", "tab_active_bg", "border",
+  "text_primary", "text_muted", "text_disabled", "notice_bg", "notice_text",
+  "accent", "terminal_cursor", "terminal_selection_bg", "terminal_selection_fg",
+];
+
+function parseThemePalette(raw: unknown): ThemePalette | null {
+  if (!isRecord(raw)) return null;
+  for (const key of THEME_PALETTE_KEYS) {
+    if (typeof raw[key] !== "string") return null;
+  }
+  return raw as unknown as ThemePalette;
+}
+
+export async function fetchTheme(): Promise<ThemeResponse | null> {
+  try {
+    const raw = await fetchJson("/api/v1/config/theme");
+    if (!isRecord(raw)) return null;
+    const slug = readString(raw["slug"]);
+    const label = readString(raw["label"]);
+    const isLight = readBoolean(raw["is_light"]);
+    const palette = parseThemePalette(raw["palette"]);
+    if (slug === null || label === null || isLight === null || palette === null) {
+      return null;
+    }
+    return { slug, label, is_light: isLight, palette };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Apply a theme palette to the document by setting CSS custom properties.
+ * Maps ThemePalette fields to the CSS variables used throughout the web UI.
+ */
+export function applyTheme(theme: ThemeResponse): void {
+  const root = document.documentElement;
+  const p = theme.palette;
+
+  // Color scheme (affects scrollbars, form controls, etc.)
+  root.style.setProperty("color-scheme", theme.is_light ? "light" : "dark");
+
+  // Background surfaces
+  root.style.setProperty("--bg", p.app_bg);
+  root.style.setProperty("--bg-surface", p.sidebar_bg);
+  root.style.setProperty("--bg-surface2", p.panel_bg);
+  root.style.setProperty("--bg-hover", p.panel_active_bg);
+  root.style.setProperty("--bg-active", p.chrome_bg);
+
+  // Text
+  root.style.setProperty("--text", p.text_primary);
+  root.style.setProperty("--text-muted", p.text_muted);
+  root.style.setProperty("--text-faint", p.text_disabled);
+
+  // Accent
+  root.style.setProperty("--accent", p.accent);
+  root.style.setProperty("--accent-hover", p.accent);
+  root.style.setProperty("--accent-subtle", `${p.accent}1a`);
+
+  // Semantic colors — use saturated variants appropriate for the background
+  if (theme.is_light) {
+    root.style.setProperty("--green", "#2da44e");
+    root.style.setProperty("--red", "#cf222e");
+    root.style.setProperty("--yellow", "#9a6700");
+    root.style.setProperty("--blue", "#0969da");
+  } else {
+    root.style.setProperty("--green", "#a6e3a1");
+    root.style.setProperty("--red", "#f38ba8");
+    root.style.setProperty("--yellow", "#f9e2af");
+    root.style.setProperty("--blue", "#89b4fa");
+  }
+
+  // Borders
+  root.style.setProperty("--border", p.border);
+  root.style.setProperty("--border-strong", p.chrome_border);
+
+  // Scrollbar
+  root.style.setProperty("--scrollbar-track", p.app_bg);
+  root.style.setProperty("--scrollbar-thumb", p.border);
+  root.style.setProperty("--scrollbar-thumb-hover", p.chrome_border);
+
+  // Tab colors
+  root.style.setProperty("--tab-bg", p.tab_bg);
+  root.style.setProperty("--tab-active-bg", p.tab_active_bg);
+
+  // Terminal-specific
+  root.style.setProperty("--terminal-bg", p.terminal_bg);
+  root.style.setProperty("--terminal-cursor", p.terminal_cursor);
+  root.style.setProperty("--terminal-selection-bg", p.terminal_selection_bg);
+  root.style.setProperty("--terminal-selection-fg", p.terminal_selection_fg);
+
+  // Overlay/dialog colors adapt to theme
+  root.style.setProperty("--overlay-bg", theme.is_light
+    ? "rgba(0, 0, 0, 0.25)"
+    : "rgba(6, 8, 12, 0.72)");
+  root.style.setProperty("--dialog-bg", theme.is_light
+    ? p.app_bg
+    : `color-mix(in srgb, ${p.panel_bg} 96%, transparent)`);
+  root.style.setProperty("--input-bg", theme.is_light
+    ? p.sidebar_bg
+    : `color-mix(in srgb, ${p.app_bg} 94%, transparent)`);
+
 }

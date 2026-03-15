@@ -16,7 +16,7 @@ import {
   parseWsServerEvent,
   serializeWsClientEvent,
 } from "../api";
-import type { TerminalSession } from "../types";
+import type { TerminalSession, ThemeResponse } from "../types";
 
 const INPUT_FLUSH_MS = 16;
 const TERMINAL_TAB_COMMAND_MAX_CHARS = 14;
@@ -422,30 +422,78 @@ function setStatus(text: string): void {
   }
 }
 
+let currentTheme: ThemeResponse | null = null;
+
 function buildXtermTheme(): Record<string, string> {
+  const t = currentTheme;
+  if (t === null) {
+    // Dark fallback before theme is fetched
+    return {
+      background: "#0f1115",
+      foreground: "#e4e4e7",
+      cursor: "#4ade80",
+      cursorAccent: "#0f1115",
+      selectionBackground: "rgba(74, 222, 128, 0.12)",
+      black: "#27272a",
+      red: "#f38ba8",
+      green: "#a6e3a1",
+      yellow: "#f9e2af",
+      blue: "#89b4fa",
+      magenta: "#cba6f7",
+      cyan: "#89dceb",
+      white: "#e4e4e7",
+      brightBlack: "#71717a",
+      brightRed: "#f38ba8",
+      brightGreen: "#a6e3a1",
+      brightYellow: "#f9e2af",
+      brightBlue: "#89b4fa",
+      brightMagenta: "#cba6f7",
+      brightCyan: "#89dceb",
+      brightWhite: "#ffffff",
+    };
+  }
+
+  const p = t.palette;
+  const isLight = t.is_light;
+
+  // Semantic colors matching applyTheme()
+  const red = isLight ? "#cf222e" : "#f38ba8";
+  const green = isLight ? "#2da44e" : "#a6e3a1";
+  const yellow = isLight ? "#9a6700" : "#f9e2af";
+  const blue = isLight ? "#0969da" : "#89b4fa";
+
   return {
-    background: "#0f1115",
-    foreground: "#e4e4e7",
-    cursor: "#4ade80",
-    cursorAccent: "#0f1115",
-    selectionBackground: "rgba(74, 222, 128, 0.12)",
-    black: "#27272a",
-    red: "#f38ba8",
-    green: "#a6e3a1",
-    yellow: "#f9e2af",
-    blue: "#89b4fa",
-    magenta: "#cba6f7",
-    cyan: "#89dceb",
-    white: "#e4e4e7",
-    brightBlack: "#71717a",
-    brightRed: "#f38ba8",
-    brightGreen: "#a6e3a1",
-    brightYellow: "#f9e2af",
-    brightBlue: "#89b4fa",
-    brightMagenta: "#cba6f7",
-    brightCyan: "#89dceb",
-    brightWhite: "#ffffff",
+    background: p.terminal_bg,
+    foreground: p.text_primary,
+    cursor: p.terminal_cursor,
+    cursorAccent: p.terminal_bg,
+    selectionBackground: p.terminal_selection_bg,
+    selectionForeground: p.terminal_selection_fg,
+    black: isLight ? "#383a42" : "#27272a",
+    red,
+    green,
+    yellow,
+    blue,
+    magenta: isLight ? "#a626a4" : "#cba6f7",
+    cyan: isLight ? "#0184bc" : "#89dceb",
+    white: isLight ? "#696c77" : "#e4e4e7",
+    brightBlack: isLight ? "#a0a1a7" : "#71717a",
+    brightRed: red,
+    brightGreen: green,
+    brightYellow: yellow,
+    brightBlue: blue,
+    brightMagenta: isLight ? "#a626a4" : "#cba6f7",
+    brightCyan: isLight ? "#0184bc" : "#89dceb",
+    brightWhite: isLight ? "#383a42" : "#ffffff",
   };
+}
+
+/** Store the current theme and re-apply to active terminal. Call after applyTheme(). */
+export function refreshTerminalTheme(theme: ThemeResponse): void {
+  currentTheme = theme;
+  if (activeInstance !== null) {
+    activeInstance.xterm.options.theme = buildXtermTheme();
+  }
 }
 
 function terminalTabTitle(session: TerminalSession): string {

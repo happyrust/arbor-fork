@@ -82,7 +82,7 @@ It gives you one place to manage repositories, issue-driven worktrees, embedded 
 - Three-pane layout across `arbor-gui` and `arbor-web-ui`
 - Command palette coverage for actions, repos, worktrees, issues, presets, and task templates
 - Resizable panes, collapsible sidebar, desktop notifications
-- More than twenty-five themes, including Omarchy defaults and white VS Code inspired themes
+- 38 themes shared between the desktop app and web UI, with live sync when switching themes
 - Branch-aware window titles and daemon / rate-limit status polish
 - TOML config at `~/.config/arbor/config.toml` with hot reload
 

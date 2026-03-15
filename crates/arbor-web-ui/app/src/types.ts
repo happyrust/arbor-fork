@@ -130,6 +130,35 @@ export type AgentActivityWsEvent =
   | { type: "update"; session: AgentSession }
   | { type: "clear"; session_id: string };
 
+export type ThemePalette = {
+  chrome_bg: string;
+  chrome_border: string;
+  app_bg: string;
+  sidebar_bg: string;
+  terminal_bg: string;
+  panel_bg: string;
+  panel_active_bg: string;
+  tab_bg: string;
+  tab_active_bg: string;
+  border: string;
+  text_primary: string;
+  text_muted: string;
+  text_disabled: string;
+  notice_bg: string;
+  notice_text: string;
+  accent: string;
+  terminal_cursor: string;
+  terminal_selection_bg: string;
+  terminal_selection_fg: string;
+};
+
+export type ThemeResponse = {
+  slug: string;
+  label: string;
+  is_light: boolean;
+  palette: ThemePalette;
+};
+
 export type WsClientEvent =
   | { type: "resize"; cols: number; rows: number }
   | { type: "signal"; signal: "interrupt" | "terminate" | "kill" }

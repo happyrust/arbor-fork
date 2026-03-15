@@ -98,6 +98,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/tasks/ws", get(task_status_ws))
         .route("/shutdown", post(shutdown_daemon))
         .route("/config/bind", post(set_bind_mode).get(get_bind_mode))
+        .route("/config/theme", get(get_theme))
         .route("/logs/ws", get(logs_ws));
 
     #[cfg(feature = "symphony")]
@@ -225,6 +226,30 @@ pub(crate) async fn set_bind_mode(
     Ok(Json(BindModeResponse {
         allow_remote: body.allow_remote,
     }))
+}
+
+pub(crate) async fn get_theme() -> Json<arbor_core::theme::ThemeResponse> {
+    let theme_slug = load_theme_slug();
+    let theme_kind = theme_slug
+        .as_deref()
+        .and_then(arbor_core::theme::ThemeKind::from_slug)
+        .unwrap_or(arbor_core::theme::ThemeKind::One);
+    Json(theme_kind.to_response())
+}
+
+fn load_theme_slug() -> Option<String> {
+    let path = daemon_config_path();
+    if !path.exists() {
+        return None;
+    }
+    let settings = config::Config::builder()
+        .add_source(config::File::from(path.as_path()).required(false))
+        .build()
+        .ok()?;
+    settings.get_string("theme").ok().and_then(|s| {
+        let trimmed = s.trim().to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
 }
 
 // ── Repository / worktree routes ─────────────────────────────────────

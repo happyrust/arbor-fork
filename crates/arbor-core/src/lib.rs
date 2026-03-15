@@ -11,6 +11,7 @@ pub mod remote;
 pub mod repo_config;
 pub mod session;
 pub mod task;
+pub mod theme;
 pub mod worktree;
 pub mod worktree_name;
 pub mod worktree_scripts;
