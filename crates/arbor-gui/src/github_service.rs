@@ -794,9 +794,7 @@ fn read_gh_hosts_token(host: &str) -> Option<String> {
             continue;
         }
 
-        if in_host_block
-            && let Some(value) = trimmed.strip_prefix("oauth_token:")
-        {
+        if in_host_block && let Some(value) = trimmed.strip_prefix("oauth_token:") {
             let token = value.trim();
             if !token.is_empty() {
                 return Some(token.to_owned());
